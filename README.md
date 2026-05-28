@@ -2,7 +2,7 @@
 
 ## Updates
 
-- [2025.XX.XX]: 🚀 STAR-KV is accepted at ICML 2025 as a spotlight (top 2.2%).
+- [2025.04.30]: 🚀 STAR-KV is accepted at ICML 2026 as a spotlight paper (top 2.2%).
 
 ## TL;DR
 
@@ -16,6 +16,7 @@ Low-rank projection is a promising approach for compressing the KV cache because
 
 - [ ] Add quantization latency tests 
 - [ ] Add trained weights file for LongChat, LLaMA-3.1-8B
+- [ ] Update citation reference
 
 ## Repository Structure
 
