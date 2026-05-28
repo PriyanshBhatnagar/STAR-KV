@@ -1,0 +1,12 @@
+torch==2.5.1
+triton==3.1.0
+transformers==4.57.1
+datasets==3.6.0
+accelerate>=1.10.1
+evaluate
+huggingface_hub
+lm_eval[longbench,ruler]
+wandb
+matplotlib
+pandas
+tqdm
