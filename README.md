@@ -166,6 +166,6 @@ If you find this work useful, please consider citing our paper:
 @inproceedings{
   title     = {STAR-KV: Low-Rank KV Cache Compression via Soft Thresholding for Adaptive Rank Control},
   booktitle = {ICML},
-  year      = {2025}
+  year      = {2026}
 }
 ```
