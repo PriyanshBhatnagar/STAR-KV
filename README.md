@@ -1,4 +1,18 @@
-# STAR-KV: Low-Rank KV Cache Compression via Soft Thresholding for Adaptive Rank Control
+# [ICML 2026] STAR-KV: Adaptive Low-Rank KV Cache Compression 
+
+Official implementation of the ICML 2026 Spotlight paper:
+
+**STAR-KV: Low-Rank KV Cache Compression via Soft Thresholding for Adaptive Rank Control**
+
+[Paper](#) [Project Page](#) [arXiv](#) [PMLR](#) <!-- links to be added -->
+
+## Authors
+
+Priyansh Bhatnagar<sup>1\*</sup>, Ashkan Moradifirouzabadi<sup>1\*</sup>, Se-Hyun Yang<sup>2</sup>, SeungJae Lee<sup>2</sup>, Jungwook Choi<sup>2</sup>, Mingu Kang<sup>1</sup>
+
+<sup>1</sup>University of California San Diego &nbsp; <sup>2</sup>D.Notitia
+
+<sup>\*</sup>Equal contribution
 
 ## Updates
 
@@ -17,6 +31,7 @@ Low-rank projection is a promising approach for compressing the KV cache because
 - [ ] Add quantization latency tests 
 - [ ] Add trained weights file for LongChat, LLaMA-3.1-8B
 - [ ] Update citation reference
+- [ ] Add links for project page, arXiv, PMLR
 
 ## Repository Structure
 
