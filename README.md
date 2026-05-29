@@ -10,7 +10,7 @@ Official implementation of the ICML 2026 Spotlight paper:
 
 Priyansh Bhatnagar<sup>1\*</sup>, Ashkan Moradifirouzabadi<sup>1\*</sup>, Se-Hyun Yang<sup>2</sup>, SeungJae Lee<sup>2</sup>, Jungwook Choi<sup>2</sup>, Mingu Kang<sup>1</sup>
 
-<sup>1</sup>University of California San Diego &nbsp; <sup>2</sup>D.Notitia
+<sup>1</sup>University of California San Diego &nbsp; <sup>2</sup>Dnotitia
 
 <sup>\*</sup>Equal contribution
 
