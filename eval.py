@@ -111,6 +111,7 @@ def evaluate_lmeval(model, tokenizer, tasks: str, batch_size: int,
                     max_length: int = None, model_name: str = ""):
     import lm_eval
     from lm_eval.models.huggingface import HFLM
+    from lm_eval.tasks import TaskManager
     from lm_eval.utils import make_table
 
     kwargs = {"pretrained": model, "tokenizer": tokenizer, "add_bos_token": False,
@@ -120,7 +121,7 @@ def evaluate_lmeval(model, tokenizer, tasks: str, batch_size: int,
         model.config.max_position_embeddings = max_length
 
     lm_obj = HFLM(**kwargs)
-    task_manager = lm_eval.tasks.TaskManager()
+    task_manager = TaskManager()
 
     task_list = [t.strip() for t in tasks.split(",")]
     print(f"Running lm-eval tasks: {task_list}")
@@ -207,6 +208,9 @@ def main():
 
     # ── Inject decomposed structure, load weights ────────────────────────────
     print("Injecting low-rank decompositions...")
+    model = model.float()
+    # replace_linear_layer modifies the model in place and returns None,
+    # so call it as a statement (do not reassign `model`).
     replace_linear_layer(model, config, skip_layers=tuple(args.skip_layers))
 
     print(f"Loading weights: {args.weights}")
@@ -218,11 +222,11 @@ def main():
 
     # Export inference-ready weights (fold Sigma, prune dead ranks) and replace
     # attention modules with the unified prefill+decode forward.
-    print("Exporting inference weights and replacing attention modules...")
-    model = replace_attn_with_triton(
-        model, config, skip_layers=tuple(args.skip_layers), dtype=torch.bfloat16
-    )
-    set_model_mode(model, "triton", skip_layers=tuple(args.skip_layers))
+    # print("Exporting inference weights and replacing attention modules...")
+    # model = replace_attn_with_triton(
+    #     model, config, skip_layers=tuple(args.skip_layers), dtype=torch.bfloat16
+    # )
+    # set_model_mode(model, "triton", skip_layers=tuple(args.skip_layers))
     model.eval()
     model.config.use_cache = True
 

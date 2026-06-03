@@ -21,13 +21,9 @@ Compression budget
 
 Example
 -------
-  python train.py \\
-    --model meta-llama/Llama-3.1-8B-Instruct \\
-    --output trained_weights.pt --output-fused fused_weights.pt \\
-    --epochs 1 --lr 2e-5 --seq-len 8192 --num-samples 4000 \\
-    --alpha-lr 1e-2 --alpha-samples 3000 --comp-weight 0.1 --kd-weight 1.0 \\
-    --desired-comp-rate 0.6 --phase3-samples 200
-"""
+  python train.py --model meta-llama/Llama-3.1-8B-Instruct --output trained_weights.pt --output-fused fused_weights.pt --epochs 1 --lr 2e-5 --seq-len 4096 --num-samples 3500 --alpha-lr 1e-2 --alpha-samples 2500 --comp-weight-k 0.1 --comp-weight-v 0.1 --kd-weight 1.0 --desired-comp-rate 0.6 --phase3-samples 200
+  python train.py --model meta-llama/Llama-3.2-3B  --output trained_weights.pt --output-fused fused_weights.pt --epochs 1 --lr 2e-5 --seq-len 4096 --num-samples 4000 --alpha-lr 1e-2 --alpha-samples 3000 --comp-weight-k 0.1 --comp-weight-v 0.1 --kd-weight 1.0 --desired-comp-rate 0.6 --phase3-samples 200
+  """
 
 
 import argparse
@@ -336,10 +332,10 @@ def main():
 
     # ── Optimizer ────────────────────────────────────────────────────────────
     # K and V alpha groups are split so each can be frozen independently when its
-    # compression budget is reached (avoids KD-driven decompression after freeze).
+    # compression budget is reached. Freezing is done by setting requires_grad=False
+    # on the alpha params (not by zeroing the group lr), because the LR scheduler
+    # re-applies base_lr*factor to every group each step and would otherwise undo it.
     no_decay = ["bias", "layer_norm.weight"]
-    K_ALPHA_GROUP_IDX = 1
-    V_ALPHA_GROUP_IDX = 2
     optimizer = torch.optim.AdamW([
         {
             "params": [p for n, p in model.named_parameters()
@@ -433,35 +429,82 @@ def main():
 
                     if not k_frozen and pk <= k_budget:
                         k_frozen = True
-                        optimizer.param_groups[K_ALPHA_GROUP_IDX]["lr"] = 0.0
+                        # Freeze K alpha (the soft-threshold) via requires_grad=False,
+                        # NOT lr=0. The LR scheduler re-applies base_lr*factor to every
+                        # group on each step, so a manual lr=0 is overwritten and alpha
+                        # keeps training — KD then drives the threshold DOWN, letting
+                        # singular values re-cross it and silently decompressing K.
+                        # requires_grad=False makes AdamW skip the param regardless of
+                        # the scheduler. (This is what the notebook's set_requires_grad
+                        # does.) diag stays trainable for KD recovery; pruned singular
+                        # values already get zero gradient, so they cannot grow back.
+                        raw_model_k = accelerator.unwrap_model(model)
+                        for n, p in raw_model_k.named_parameters():
+                            if "k_proj" in n and "alpha" in n:
+                                p.requires_grad_(False)
                         pbar.write(
                             f"  [K frozen] step={global_step + 1}: "
                             f"K_comp={1-pk/full_k_params:.1%}≥{k_comp_rate:.0%} — "
-                            f"K alpha LR → 0, K comp loss dropped"
+                            f"K alpha frozen (requires_grad=False), K comp loss dropped"
                         )
 
                     if not v_frozen and pv <= v_budget:
                         v_frozen = True
-                        optimizer.param_groups[V_ALPHA_GROUP_IDX]["lr"] = 0.0
+                        # Same for V: freeze the threshold itself, not its lr.
+                        raw_model_v = accelerator.unwrap_model(model)
+                        for n, p in raw_model_v.named_parameters():
+                            if "v_proj" in n and "alpha" in n:
+                                p.requires_grad_(False)
                         pbar.write(
                             f"  [V frozen] step={global_step + 1}: "
                             f"V_comp={1-pv/full_v_params:.1%}≥{v_comp_rate:.0%} — "
-                            f"V alpha LR → 0, V comp loss dropped"
+                            f"V alpha frozen (requires_grad=False), V comp loss dropped"
                         )
 
                     if (k_frozen and v_frozen) or (global_step >= args.alpha_samples):
-                        # Ensure both alpha groups are zeroed (handles step-limit fallback)
-                        optimizer.param_groups[K_ALPHA_GROUP_IDX]["lr"] = 0.0
-                        optimizer.param_groups[V_ALPHA_GROUP_IDX]["lr"] = 0.0
                         phase2_entered = True
                         reason = (
                             "both budgets reached"
                             if k_frozen and v_frozen
                             else f"alpha_samples={args.alpha_samples} step limit"
                         )
+                        # Step-limit fallback: budgets not both met, so freeze any
+                        # still-trainable alpha now (same requires_grad=False reason).
+                        raw_model = accelerator.unwrap_model(model)
+                        for n, p in raw_model.named_parameters():
+                            if "alpha" in n:
+                                p.requires_grad_(False)
+                        # Fresh optimizer over the remaining trainable params (U/V/diag;
+                        # alpha is now frozen out). Resets Adam state so Phase 1 momentum
+                        # doesn't carry into recovery — mirrors the notebook's kernel
+                        # restart with a new optimizer for phase 2.
+                        optimizer = torch.optim.AdamW([
+                            {
+                                "params": [
+                                    p for n, p in raw_model.named_parameters()
+                                    if p.requires_grad
+                                    and not any(nd in n for nd in no_decay)
+                                ],
+                                "weight_decay": 0.01, "lr": args.lr,
+                            },
+                            {
+                                "params": [
+                                    p for n, p in raw_model.named_parameters()
+                                    if p.requires_grad
+                                    and any(nd in n for nd in no_decay)
+                                ],
+                                "weight_decay": 0.0, "lr": args.lr,
+                            },
+                        ])
+                        steps_remaining = max(1, num_steps - global_step)
+                        lr_sched = get_scheduler(
+                            "linear", optimizer=optimizer,
+                            num_warmup_steps=0,
+                            num_training_steps=steps_remaining,
+                        )
                         pbar.write(
-                            f"  [Phase 2] step={global_step + 1}: all alpha LR → 0 "
-                            f"({reason}), continuing with KD loss only for recovery"
+                            f"  [Phase 2] step={global_step + 1}: alpha frozen, fresh "
+                            f"optimizer (U/V/diag, {reason}), KD loss only for recovery"
                         )
 
             if (step + 1) % args.log_steps == 0:

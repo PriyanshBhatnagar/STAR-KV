@@ -8,9 +8,10 @@ Official implementation of the ICML 2026 Spotlight paper:
 
 ## Authors
 
-Priyansh Bhatnagar<sup>1\*</sup>, Ashkan Moradifirouzabadi<sup>1\*</sup>, Se-Hyun Yang<sup>2</sup>, SeungJae Lee<sup>2</sup>, Jungwook Choi<sup>2</sup>, Mingu Kang<sup>1</sup>
+Priyansh Bhatnagar<sup>1\*</sup>, Ashkan Moradifirouzabadi<sup>1\*</sup>, Se-Hyun Yang<sup>2</sup>, SeungJae Lee<sup>2</sup>, Jungwook Choi<sup>3</sup>, Mingu Kang<sup>1</sup>
 
-<sup>1</sup>University of California San Diego &nbsp; <sup>2</sup>Dnotitia
+<sup>1</sup>University of California San Diego &nbsp; <sup>2</sup>Dnotitia &nbsp; <sup>3</sup>Hanyang University
+
 
 <sup>\*</sup>Equal contribution
 
@@ -32,6 +33,7 @@ Low-rank projection is a promising approach for compressing the KV cache because
 - [ ] Add trained weights file for LongChat, LLaMA-3.1-8B
 - [ ] Update citation reference
 - [ ] Add links for project page, arXiv, PMLR
+- [ ] Fix kernels for acc analysis
 
 ## Repository Structure
 
@@ -44,8 +46,7 @@ Low-rank projection is a promising approach for compressing the KV cache because
 ├── LlamaLoRaAttention_headwise.py       # Low-rank attention module w/ Triton (no quantization)
 ├── LlamaLoRaAttention_headwise_quant.py # Low-rank attention module w/ Triton (int8/int4 KV cache)
 ├── abx_rope_batched.py                  # Triton kernel: fused A@(B@X^T + RoPE)
-├── bx_quant.py                          # Triton kernel: fused dequant + B@X for V
-└── results/                             # Pre-computed benchmark plots and data
+└── bx_quant.py                          # Triton kernel: fused dequant + B@X for V
 ```
 
 ## Installation

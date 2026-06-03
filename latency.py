@@ -415,6 +415,7 @@ def main():
     )
     config = model.config
 
+    model = model.float()
     replace_linear_layer(model, config, skip_layers=tuple(args.skip_layers))
     print(f"Loading weights: {args.weights}")
     model.load_state_dict(

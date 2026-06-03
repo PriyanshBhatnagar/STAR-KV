@@ -69,27 +69,42 @@ def _abx_fwd(
     BLOCK_SIZE_R: tl.constexpr,
     BLOCK_SIZE_L: tl.constexpr,
     NUM_GROUPS: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
     THETA: tl.constexpr,
 ):
     pid_b = tl.program_id(axis=0)
     pid_h = tl.program_id(axis=1)
     pid_l = tl.program_id(axis=2)
 
-    HEAD_GROUPS_ID = pid_h // (32 // NUM_GROUPS)
+    # GROUP_SIZE = num_query_heads // num_kv_groups (query heads sharing one KV head).
+    # Query head pid_h reads the compressed K cache of KV group pid_h // GROUP_SIZE.
+    # (Previously hardcoded as 32 // NUM_GROUPS, which assumed 32 query heads.)
+    HEAD_GROUPS_ID = pid_h // GROUP_SIZE
     offs_ds = tl.arange(0, BLOCK_SIZE_D)
     offs_rs = tl.arange(0, BLOCK_SIZE_R)
     offs_ls = (pid_l * BLOCK_SIZE_L) + tl.arange(0, BLOCK_SIZE_L)
 
     A_ptrs = a_ptr + pid_b * stride_ab + pid_h * stride_az + (0 * stride_aa + offs_ds[None, :] * stride_ad)
-    B_ptrs = b_ptr + pid_h * stride_bz + (offs_rs[:, None] * stride_br + offs_ds[None, :] * stride_bd)
+    # B (k_u U^T) is stored per KV head, so it is indexed by the KV group, not the
+    # query head. For MHA (GROUP_SIZE=1) HEAD_GROUPS_ID == pid_h, so this is a no-op.
+    B_ptrs = b_ptr + HEAD_GROUPS_ID * stride_bz + (offs_rs[:, None] * stride_br + offs_ds[None, :] * stride_bd)
     X_ptrs = x_ptr + pid_b * stride_xb + HEAD_GROUPS_ID * stride_xhg + (offs_ls[:, None] * stride_xl + offs_rs[None, :] * stride_xr)
     O_ptrs = out_ptr + pid_b * stride_ob + pid_h * stride_oz + (0 * stride_oa + offs_ls[None, :] * stride_ol)
 
     xb_0 = tl.zeros((BLOCK_SIZE_L, BLOCK_SIZE_D), dtype=tl.float32)
     xb_1 = tl.zeros((BLOCK_SIZE_L, BLOCK_SIZE_D), dtype=tl.float32)
 
+    # Sequence-dim mask: seq_len (KV cache length, e.g. ctx+1 at decode) is rarely
+    # a multiple of BLOCK_SIZE_L, so the final L-block runs past the end of X/out.
+    # Mask both the X load and the O store on offs_ls to avoid OOB accesses.
+    ls_mask = offs_ls < seq_len
+
     for r in range(0, tl.cdiv(R, BLOCK_SIZE_R)):
-        x = tl.load(X_ptrs, mask=offs_rs[None, :] < R - r * BLOCK_SIZE_R, other=0.0)
+        x = tl.load(
+            X_ptrs,
+            mask=(offs_rs[None, :] < R - r * BLOCK_SIZE_R) & ls_mask[:, None],
+            other=0.0,
+        )
         b_0 = tl.load(B_ptrs, mask=offs_rs[:, None] < R - r * BLOCK_SIZE_R, other=0.0)
         b_1 = tl.load(B_ptrs + BLOCK_SIZE_D * stride_bd, mask=offs_rs[:, None] < R - r * BLOCK_SIZE_R, other=0.0)
         xb_0 = tl.dot(x, b_0, xb_0)
@@ -115,7 +130,7 @@ def _abx_fwd(
     abx_0 = tl.sum(a_0 * xb_0, 1)
     abx_1 = tl.sum(a_1 * xb_1, 1)
     abx = abx_0 + abx_1
-    tl.store(O_ptrs, abx[None, :])
+    tl.store(O_ptrs, abx[None, :], mask=ls_mask[None, :])
 
 
 def abx(a: torch.Tensor, b: torch.Tensor, x: torch.Tensor, dtype=torch.float16) -> torch.Tensor:
@@ -134,13 +149,17 @@ def abx(a: torch.Tensor, b: torch.Tensor, x: torch.Tensor, dtype=torch.float16) 
     assert b.dim() == 3
     assert x.dim() == 4
 
+    # a is per query head (num_heads); b is per KV head (num_groups). Keep them
+    # distinct — do NOT let b's head count clobber num_heads (breaks GQA grids).
     batch_size, num_heads, _, head_dim = a.shape
-    num_heads, rank_per_head_groups, head_dim = b.shape
+    _num_kv_heads, rank_per_head_groups, head_dim = b.shape
     batch_size, num_groups, seq_len, rank_per_head_groups = x.shape
 
     out = torch.empty((batch_size, num_heads, 1, seq_len), dtype=x.dtype, device=x.device)
     BLOCK_SIZE_D = 64
     NUM_GROUPS = num_groups
+    # query heads per KV group (GQA). For MHA this is 1.
+    GROUP_SIZE = num_heads // num_groups
 
     if dtype == torch.float16:
         dtype_tl = tl.float16
@@ -149,7 +168,7 @@ def abx(a: torch.Tensor, b: torch.Tensor, x: torch.Tensor, dtype=torch.float16) 
     elif dtype == torch.float32:
         dtype_tl = tl.float32
 
-    grid = lambda META: (batch_size, 32, triton.cdiv(seq_len, META["BLOCK_SIZE_L"]))
+    grid = lambda META: (batch_size, num_heads, triton.cdiv(seq_len, META["BLOCK_SIZE_L"]))
     _abx_fwd[grid](
         a, b, x, out,
         a.stride(0), a.stride(1), a.stride(2), a.stride(3),
@@ -162,6 +181,7 @@ def abx(a: torch.Tensor, b: torch.Tensor, x: torch.Tensor, dtype=torch.float16) 
         dtype_tl=dtype_tl,
         BLOCK_SIZE_D=BLOCK_SIZE_D,
         NUM_GROUPS=NUM_GROUPS,
+        GROUP_SIZE=GROUP_SIZE,
         THETA=10000.,
     )
     return out

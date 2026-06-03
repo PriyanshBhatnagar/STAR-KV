@@ -430,6 +430,10 @@ def _patched_attn_forward(
         # Prefill: materialise full K/V and use SDPA (Flash Attention path)
         key_full = torch.matmul(key_states, k_u.transpose(-2, -1).to(key_states.dtype))
         key_full = _rope(key_full, cos, sin)
+        # GQA: key_full has num_key_value_heads (8); query has num_attention_heads
+        # (24). Expand K to match Q so SDPA head dims line up. For MHA models
+        # (num_key_value_groups == 1) this is a no-op.
+        key_full = key_full.repeat_interleave(self.num_key_value_groups, dim=1)
         value_full = (
             torch.matmul(value_states, v_u.weight.T)
             .view(*value_states.shape[:-1], H, Hd)
@@ -455,6 +459,9 @@ def _patched_attn_forward(
         else:
             key_full = torch.matmul(key_states, k_u.transpose(-2, -1).to(key_states.dtype))
             key_full = _rope(key_full, cos, sin)
+            # GQA: expand K from num_key_value_heads to num_attention_heads so it
+            # matches query_states. No-op for MHA (num_key_value_groups == 1).
+            key_full = key_full.repeat_interleave(self.num_key_value_groups, dim=1)
             attn_weights = torch.matmul(query_states, key_full.transpose(2, 3)) * self.scaling
 
         if attention_mask is not None:
@@ -467,10 +474,17 @@ def _patched_attn_forward(
             training=self.training,
         )
 
-        # Aggregate compact V then expand with U (avoids full V materialisation)
-        prob_v = attn_weights.squeeze(2) @ value_states          # [B, H, rank_v]
-        v_u_head = v_u.weight.view(H, Hd, value_states.shape[-1])  # [H, Hd, rank_v]
-        attn_output = prob_v.unsqueeze(-2) @ v_u_head.transpose(-1, -2)  # [B, H, 1, Hd]
+        # Aggregate compact V then expand with U (avoids full V materialisation).
+        # attn_weights spans all query heads (Hq); value_states is the shared global
+        # compact V. prob_v is per query head, but the U expansion block is per KV
+        # head, so repeat each KV head's U across its query-head group (GQA).
+        # For MHA (num_key_value_groups == 1) the repeat is a no-op.
+        rank_v = value_states.shape[-1]
+        Hq = query_states.shape[1]
+        prob_v = attn_weights.squeeze(2) @ value_states          # [B, Hq, rank_v]
+        v_u_head = v_u.weight.view(H, Hd, rank_v)                 # [H_kv, Hd, rank_v]
+        v_u_head = v_u_head.repeat_interleave(self.num_key_value_groups, dim=0)  # [Hq, Hd, rank_v]
+        attn_output = prob_v.unsqueeze(-2) @ v_u_head.transpose(-1, -2)  # [B, Hq, 1, Hd]
 
     attn_output = attn_output.transpose(1, 2).contiguous()
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()

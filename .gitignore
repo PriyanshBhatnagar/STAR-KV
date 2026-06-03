@@ -10,3 +10,6 @@ build/
 *.safetensors
 .DS_Store
 .ipynb_checkpoints/
+train_eval.ipynb
+results/
+.gitignore
