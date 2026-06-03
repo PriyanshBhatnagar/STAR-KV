@@ -78,7 +78,6 @@ def _abx_fwd(
 
     # GROUP_SIZE = num_query_heads // num_kv_groups (query heads sharing one KV head).
     # Query head pid_h reads the compressed K cache of KV group pid_h // GROUP_SIZE.
-    # (Previously hardcoded as 32 // NUM_GROUPS, which assumed 32 query heads.)
     HEAD_GROUPS_ID = pid_h // GROUP_SIZE
     offs_ds = tl.arange(0, BLOCK_SIZE_D)
     offs_rs = tl.arange(0, BLOCK_SIZE_R)

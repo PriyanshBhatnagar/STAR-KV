@@ -7,8 +7,8 @@ Training runs in three phases:
   Phase 1: KD loss + compression loss, alpha LR active.
            Ends when the desired KV compression budget is reached (see
            --desired-comp-rate), with --alpha-samples as a step-count fallback.
-  Phase 2 (remaining steps):       KD loss only, alpha LR set to 0 for recovery.
-  Phase 3 (--phase3-samples steps): Sigma fused into V (fixed rank), KD-only fine-tune
+  Phase 2 (remaining steps):       KD loss only for recovery.
+  Phase 3 (--phase3-samples steps): Sigma fused into V (fixed rank), KD-only minor fine-tune
                                     of fused U/VS modules.  Saved to --output-fused.
                                     Weights load directly into latency.py Triton setup.
 
@@ -434,10 +434,6 @@ def main():
                         # group on each step, so a manual lr=0 is overwritten and alpha
                         # keeps training — KD then drives the threshold DOWN, letting
                         # singular values re-cross it and silently decompressing K.
-                        # requires_grad=False makes AdamW skip the param regardless of
-                        # the scheduler. (This is what the notebook's set_requires_grad
-                        # does.) diag stays trainable for KD recovery; pruned singular
-                        # values already get zero gradient, so they cannot grow back.
                         raw_model_k = accelerator.unwrap_model(model)
                         for n, p in raw_model_k.named_parameters():
                             if "k_proj" in n and "alpha" in n:
@@ -469,15 +465,14 @@ def main():
                             else f"alpha_samples={args.alpha_samples} step limit"
                         )
                         # Step-limit fallback: budgets not both met, so freeze any
-                        # still-trainable alpha now (same requires_grad=False reason).
+                        # still-trainable alpha now
                         raw_model = accelerator.unwrap_model(model)
                         for n, p in raw_model.named_parameters():
                             if "alpha" in n:
                                 p.requires_grad_(False)
                         # Fresh optimizer over the remaining trainable params (U/V/diag;
                         # alpha is now frozen out). Resets Adam state so Phase 1 momentum
-                        # doesn't carry into recovery — mirrors the notebook's kernel
-                        # restart with a new optimizer for phase 2.
+                        # doesn't carry into recovery.
                         optimizer = torch.optim.AdamW([
                             {
                                 "params": [
@@ -548,11 +543,10 @@ def main():
 
         # Fuse Sigma into V in-place; model stays as LlamaForCausalLM with
         # DecomposeLinear modules — no Triton, no custom attention during training.
-        # latency.py can call replace_attn_with_triton on the saved weights later.
         raw_model = accelerator.unwrap_model(model)
         _fuse_sigma_into_v_inplace(raw_model, args.skip_layers)
 
-        # New optimizer — old one references now-gone U/S/V params.
+        # New optimizer — as old one references now-gone U/S/V params.
         p3_optimizer = torch.optim.AdamW(
             [p for p in raw_model.parameters() if p.requires_grad],
             lr=args.lr,
