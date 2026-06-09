@@ -273,10 +273,10 @@ def run_test(args):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Benchmark or test the fused ABX+RoPE Triton kernel.")
-    parser.add_argument("--total_rank", type=int, default=int(4096 * 0.2))
+    parser.add_argument("--total_rank", type=int, default=int(4096 * 0.2), help="Total compressed ranks")
     parser.add_argument("--num_heads", type=int, default=32, help="Number of attention heads (32 for LLaMA-7B)")
     parser.add_argument("--head_dim", type=int, default=128, help="Head dimension (128 for LLaMA-7B)")
-    parser.add_argument("--group_size", type=int, default=4, help="Number of heads per KV group")
+    parser.add_argument("--group_size", type=int, default=4, help="Number of heads per KV group (for GQA models). For MHA choose 1")
     parser.add_argument("--target_seq_lens", nargs="+", type=int, default=[4096, 16384, 65536, 262144])
     parser.add_argument("--check", action="store_true", help="Run correctness check instead of benchmark")
     return parser.parse_args()
