@@ -34,7 +34,7 @@ Low-rank projection is a promising approach for compressing the KV cache because
 - [ ] Update citation reference
 - [ ] Add links for project page, arXiv, PMLR
 - [ ] Fix kernels for acc analysis
-- [x] Pre-release of STAR-KV
+- [x] ~~Pre-release of STAR-KV~~
 
 ## Repository Structure
 
