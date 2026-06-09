@@ -1,6 +1,6 @@
 # [ICML 2026] STAR-KV: Adaptive Low-Rank KV Cache Compression 
 
-Official implementation of the ICML 2026 Spotlight paper:
+Official implementation of the **ICML 2026 Spotlight** paper:
 
 **STAR-KV: Low-Rank KV Cache Compression via Soft Thresholding for Adaptive Rank Control**
 
@@ -180,10 +180,13 @@ python bx_quant.py --total_rank 1228
 If you find this work useful, please consider citing our paper:
 
 ```
-@inproceedings{starkv2026,
-  title     = {STAR-KV: Low-Rank KV Cache Compression via Soft Thresholding for Adaptive Rank Control},
-  author    = {Priyansh Bhatnagar and Ashkan Moradifirouzabadi, and Se-Hyun Yang and SeungJae Lee, and Jungwook Choi and Mingu Kang},
-  booktitle = {ICML},
-  year      = {2026}
+@misc{starkv2026,
+      title={STAR-KV: Low-Rank KV Cache Compression via Soft Thresholding for Adaptive Rank Control}, 
+      author={Priyansh Bhatnagar and Ashkan Moradifirouzabadi and Se-Hyun Yang and SeungJae Lee and Jungwook Choi and Mingu Kang},
+      year={2026},
+      eprint={2606.08382},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2606.08382}, 
 }
 ```
