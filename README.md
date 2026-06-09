@@ -46,7 +46,7 @@ Low-rank projection is a promising approach for compressing the KV cache because
 ├── soft_thres_layer.py                  # Learnable soft-threshold function
 ├── LlamaLoRaAttention_headwise.py       # Low-rank attention module w/ Triton (no quantization)
 ├── LlamaLoRaAttention_headwise_quant.py # Low-rank attention module w/ Triton (int8/int4 KV cache)
-├── abx_rope_batched.py                  # Triton kernel: fused A@(B@X^T + RoPE)
+├── abx_rope_batched.py                  # Triton kernel: fused A@(B@X^T + RoPE) for K
 └── bx_quant.py                          # Triton kernel: fused dequant + B@X for V
 ```
 
