@@ -202,43 +202,53 @@ def run_layerwise(args, model, config, output_dir):
     dtype = torch.bfloat16
     device = get_device()
     scale = 1.0 / math.sqrt(config.head_dim)
-    H = config.num_attention_heads
+    Hq = config.num_attention_heads
+    Hkv = config.num_key_value_heads
     Hd = config.head_dim
     skip = set(args.skip_layers)
 
+    # Ranks are stored per KV head. Dividing VS rows by num_attention_heads
+    # under-reports them by the GQA group size and benchmarks the wrong shape.
     layer_ranks = {}
     for i, block in enumerate(model.model.layers):
         if i in skip:
             continue
-        rk = block.self_attn.k_proj.VS.weight.shape[0] // H
+        ranks = block.self_attn.k_proj.ranks.tolist()
         rv = block.self_attn.v_proj.VS.weight.shape[0]
-        layer_ranks[i] = (rk, rv)
+        layer_ranks[i] = (ranks, rv)
 
-    print(f"\nPer-layer ranks (seq_len={seq}, batch={bs}):")
-    for i, (rk, rv) in sorted(layer_ranks.items()):
-        print(f"  Layer {i:2d}: rank_k/head={rk:3d}, rank_v={rv:4d}")
+    print(f"\nPer-layer ranks (seq_len={seq}, batch={bs}, "
+          f"q_heads={Hq}, kv_heads={Hkv}):")
+    for i, (ranks, rv) in sorted(layer_ranks.items()):
+        print(f"  Layer {i:2d}: rank_k/kv-head={ranks} (max={max(ranks)}), rank_v={rv:4d}")
 
     def _ms(fn):
         ms, _, _ = _tt.do_bench(fn, quantiles=[0.5, 0.2, 0.8], warmup=10, rep=30)
         return ms * 1000  # ms → μs
 
     rows = []
-    for i, (rk, rv) in sorted(layer_ranks.items()):
+    for i, (ranks, rv) in sorted(layer_ranks.items()):
         torch.cuda.empty_cache()
         gc.collect()
+        max_r = max(ranks)
         try:
-            Q = torch.randn(bs, H, 1, Hd, dtype=dtype, device=device)
-            K_c = torch.randn(bs, H, seq, rk, dtype=dtype, device=device)
+            r_vec = torch.tensor(ranks, dtype=torch.int32, device=device)
+            Q = torch.randn(bs, Hq, 1, Hd, dtype=dtype, device=device)
+            K_c = torch.randn(bs, Hkv, seq, max_r, dtype=dtype, device=device)
             V_c = torch.randn(bs, seq, rv, dtype=dtype, device=device)
-            k_u = torch.randn(H, Hd, rk, dtype=dtype, device=device)
-            v_u = torch.randn(H, Hd, rv, dtype=dtype, device=device)
+            k_u = torch.randn(Hkv, Hd, max_r, dtype=dtype, device=device)
+            v_u = torch.randn(Hq, Hd, rv, dtype=dtype, device=device)
+            # Zero the padded tail so the padded and dynamic paths are equivalent.
+            for h, r in enumerate(ranks):
+                k_u[h, :, r:] = 0
+                K_c[:, h, :, r:] = 0
             k_u_T = k_u.transpose(-2, -1).contiguous()
             v_u_T = v_u.transpose(-1, -2).contiguous()
 
             # BF16 SDPA baseline
             try:
-                K_full = torch.randn(bs, H, seq, Hd, dtype=dtype, device=device)
-                V_full = torch.randn(bs, H, seq, Hd, dtype=dtype, device=device)
+                K_full = torch.randn(bs, Hq, seq, Hd, dtype=dtype, device=device)
+                V_full = torch.randn(bs, Hq, seq, Hd, dtype=dtype, device=device)
                 t_sdpa = _ms(lambda: F.scaled_dot_product_attention(Q, K_full, V_full))
                 del K_full, V_full
             except torch.cuda.OutOfMemoryError:
@@ -246,9 +256,10 @@ def run_layerwise(args, model, config, output_dir):
                 torch.cuda.empty_cache()
                 gc.collect()
 
-            # Low-rank, no Triton
+            # Low-rank, no Triton (K expanded per KV head, then broadcast to query heads)
             def _no_tri():
                 K_exp = torch.matmul(K_c, k_u_T)
+                K_exp = K_exp.repeat_interleave(Hq // Hkv, dim=1)
                 attn = F.softmax(
                     torch.matmul(Q, K_exp.transpose(-2, -1)) * scale,
                     dim=-1, dtype=torch.float32
@@ -258,16 +269,33 @@ def run_layerwise(args, model, config, output_dir):
 
             t_no_tri = _ms(_no_tri)
 
-            # Low-rank + Triton
-            def _tri():
+            # Precomputed so the timed region does not include building it.
+            # Values are irrelevant here (random inputs); only the shape/cost is.
+            inv_freq = 1.0 / (10000.0 ** (
+                torch.arange(0, Hd // 2, dtype=torch.float32, device=device) * 2 / Hd
+            ))
+
+            # Low-rank + Triton, padded to max rank across heads
+            def _tri_uniform():
                 attn = F.softmax(
-                    _abx(Q, k_u_T, K_c, dtype=dtype) * scale,
+                    _abx(Q, k_u_T, K_c, inv_freq=inv_freq, dtype=dtype) * scale,
                     dim=-1, dtype=torch.float32
                 ).to(dtype)
                 pv = attn.squeeze(2) @ V_c
                 return pv.unsqueeze(-2) @ v_u_T
 
-            t_tri = _ms(_tri)
+            t_tri_uni = _ms(_tri_uniform)
+
+            # Low-rank + Triton, per-head dynamic rank
+            def _tri_dynamic():
+                attn = F.softmax(
+                    _abx(Q, k_u_T, K_c, ranks=r_vec, inv_freq=inv_freq, dtype=dtype) * scale,
+                    dim=-1, dtype=torch.float32
+                ).to(dtype)
+                pv = attn.squeeze(2) @ V_c
+                return pv.unsqueeze(-2) @ v_u_T
+
+            t_tri = _ms(_tri_dynamic)
 
             del Q, K_c, V_c, k_u, v_u, k_u_T, v_u_T
             torch.cuda.empty_cache()
@@ -275,19 +303,29 @@ def run_layerwise(args, model, config, output_dir):
             sp_nt = t_sdpa / t_no_tri if not math.isnan(t_sdpa) else float("nan")
             sp_t = t_sdpa / t_tri if not math.isnan(t_sdpa) else float("nan")
             print(
-                f"  Layer {i:2d}  rk={rk:3d} rv={rv:4d}  "
-                f"sdpa={t_sdpa:7.1f}μs  no-tri={t_no_tri:7.1f}μs  tri={t_tri:7.1f}μs  "
-                f"sp(no-tri/sdpa)={sp_nt:.2f}×  sp(tri/sdpa)={sp_t:.2f}×"
+                f"  Layer {i:2d}  rk={min(ranks):3d}..{max_r:3d} rv={rv:4d}  "
+                f"sdpa={t_sdpa:7.1f}μs  no-tri={t_no_tri:7.1f}μs  "
+                f"tri-uni={t_tri_uni:7.1f}μs  tri-dyn={t_tri:7.1f}μs  "
+                f"sp(no-tri)={sp_nt:.2f}×  sp(tri-dyn)={sp_t:.2f}×"
             )
             rows.append(dict(
-                layer=i, rank_k=rk, rank_v=rv,
-                sdpa=t_sdpa, no_triton=t_no_tri, triton=t_tri,
+                layer=i, rank_k_min=min(ranks), rank_k_max=max_r, rank_v=rv,
+                sdpa=t_sdpa, no_triton=t_no_tri,
+                triton_uniform=t_tri_uni, triton=t_tri,
                 sp_no_triton=sp_nt, sp_triton=sp_t,
+                sp_triton_uniform=t_sdpa / t_tri_uni if not math.isnan(t_sdpa) else float("nan"),
             ))
         except torch.cuda.OutOfMemoryError:
             print(f"  Layer {i:2d}: OOM — skipping")
             torch.cuda.empty_cache()
             gc.collect()
+
+    if rows:
+        n = len(rows)
+        print(f"\n  avg speedup vs SDPA, uniform-padded : "
+              f"{sum(r['sp_triton_uniform'] for r in rows) / n:.2f}×")
+        print(f"  avg speedup vs SDPA, dynamic rank   : "
+              f"{sum(r['sp_triton'] for r in rows) / n:.2f}×")
 
     df = pd.DataFrame(rows)
     csv_path = os.path.join(output_dir, "layerwise_latency.csv")
@@ -416,12 +454,23 @@ def main():
     config = model.config
 
     model = model.float()
-    replace_linear_layer(model, config, skip_layers=tuple(args.skip_layers))
+    # init_svd=False: the checkpoint below overwrites every factor, so the SVD
+    # would be ~15 min of discarded work.
+    replace_linear_layer(model, config, skip_layers=tuple(args.skip_layers),
+                         init_svd=False)
     print(f"Loading weights: {args.weights}")
-    model.load_state_dict(
+    missing, _ = model.load_state_dict(
         torch.load(args.weights, map_location="cpu", weights_only=False),
         strict=False,
     )
+    # init_svd=False leaves factors zeroed, so a silently-missing key would
+    # produce a dead layer rather than a merely inaccurate one.
+    _critical = [k for k in missing if any(t in k for t in (".U.", ".V.", "Sigma"))]
+    if _critical:
+        raise RuntimeError(
+            f"{len(_critical)} decomposition tensors missing from the checkpoint; "
+            f"they would stay zero. First few: {_critical[:5]}"
+        )
     model = model.bfloat16()
 
     print("Exporting and replacing attention modules...")

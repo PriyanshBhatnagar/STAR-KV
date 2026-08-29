@@ -1,10 +1,22 @@
-"""Fused low-rank KV + RoPE Triton kernel.
+"""Fused low-rank KV + RoPE Triton kernel, with per-head dynamic rank.
 
 Implements the fused ABX operation: out = A @ (B @ X^T + RoPE(B @ X^T))
 where:
     A: query states       (batch, num_heads, 1, head_dim)
-    B: U^T of K SVD      (num_heads, rank_per_group, head_dim)
-    X: compressed K cache (batch, num_groups, seq_len, rank_per_group)
+    B: U^T of K SVD      (num_kv_heads, max_rank, head_dim)
+    X: compressed K cache (batch, num_groups, seq_len, max_rank)
+
+Heads keep different numbers of singular directions, so the rank is passed as a
+per-KV-head vector rather than one scalar shared by every head:
+
+    R = tl.load(r_ptr + kv_head)          # per-head trip count
+
+Storage stays padded to the layer's max rank with uniform strides -- only the
+GEMM trip count varies per head, so a head that kept 30 of 94 directions stops
+after 2 blocks instead of 6. Padded rows of B and X are zero, so stopping early
+is exact, not an approximation; --check asserts bit-equality against a
+full-rank run. Differing trip counts across program ids is block-level
+divergence, not warp divergence, so there is no intra-warp penalty.
 
 Run `python abx_rope_batched.py --check` to verify correctness.
 Run `python abx_rope_batched.py` to benchmark across sequence lengths.
@@ -38,13 +50,19 @@ def set_random_seed(seed=0):
 
 
 @triton.jit
-def get_freq_multi_tokens(starting_idx, theta: tl.constexpr, NB_TOKENS: tl.constexpr):
-    DIM: tl.constexpr = 128
+def get_freq_multi_tokens(inv_freq_ptr, starting_idx, NB_TOKENS: tl.constexpr):
+    """cos/sin for NB_TOKENS positions from a precomputed inverse-frequency table.
+
+    inv_freq is supplied by the caller rather than derived from a closed-form
+    1/theta**(2i/d) here. That closed form only covers default RoPE; llama3,
+    yarn, linear and dynamic scaling all reshape inv_freq per dimension (llama3
+    on Llama-3.2-3B moves low-frequency dims by up to 32x), and reproducing
+    that in-kernel would silently drift from the RoPE applied to the queries.
+    """
     DIM_2: tl.constexpr = 64
-    freqs = tl.arange(0, DIM_2) * 2
-    freqs = freqs.to(tl.float32) / DIM
-    freqs = tl.extra.cuda.libdevice.fast_powf(theta, freqs)
-    freqs = (tl.arange(0, NB_TOKENS) + starting_idx)[:, None] / freqs[None, :]
+    inv_freq = tl.load(inv_freq_ptr + tl.arange(0, DIM_2))
+    pos = (tl.arange(0, NB_TOKENS) + starting_idx).to(tl.float32)
+    freqs = pos[:, None] * inv_freq[None, :]
     return tl.extra.cuda.libdevice.fast_cosf(freqs), tl.extra.cuda.libdevice.fast_sinf(freqs)
 
 
@@ -58,19 +76,19 @@ def get_configs():
 )
 @triton.jit
 def _abx_fwd(
-    a_ptr, b_ptr, x_ptr, out_ptr,
+    a_ptr, b_ptr, x_ptr, out_ptr, r_ptr, inv_freq_ptr,
     stride_ab, stride_az, stride_aa, stride_ad,
     stride_bz, stride_br, stride_bd,
     stride_xb, stride_xhg, stride_xl, stride_xr,
     stride_ob, stride_oz, stride_oa, stride_ol,
-    R, D, seq_len,
+    D, seq_len,
     dtype_tl: tl.constexpr,
     BLOCK_SIZE_D: tl.constexpr,
     BLOCK_SIZE_R: tl.constexpr,
     BLOCK_SIZE_L: tl.constexpr,
     NUM_GROUPS: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
-    THETA: tl.constexpr,
+    ATTN_SCALING: tl.constexpr,
 ):
     pid_b = tl.program_id(axis=0)
     pid_h = tl.program_id(axis=1)
@@ -79,6 +97,11 @@ def _abx_fwd(
     # GROUP_SIZE = num_query_heads // num_kv_groups (query heads sharing one KV head).
     # Query head pid_h reads the compressed K cache of KV group pid_h // GROUP_SIZE.
     HEAD_GROUPS_ID = pid_h // GROUP_SIZE
+
+    # Per-head rank. Ranks are stored per KV head (B and X are both indexed by
+    # HEAD_GROUPS_ID), so every query head in a group shares the trip count.
+    R = tl.load(r_ptr + HEAD_GROUPS_ID)
+
     offs_ds = tl.arange(0, BLOCK_SIZE_D)
     offs_rs = tl.arange(0, BLOCK_SIZE_R)
     offs_ls = (pid_l * BLOCK_SIZE_L) + tl.arange(0, BLOCK_SIZE_L)
@@ -115,9 +138,12 @@ def _abx_fwd(
     xb_1 = xb_1.to(dtype_tl)
 
     start_block = pid_l * BLOCK_SIZE_L
-    cos, sin = get_freq_multi_tokens(starting_idx=start_block, theta=THETA, NB_TOKENS=BLOCK_SIZE_L)
-    cos = cos.to(dtype_tl)
-    sin = sin.to(dtype_tl)
+    cos, sin = get_freq_multi_tokens(inv_freq_ptr, starting_idx=start_block,
+                                     NB_TOKENS=BLOCK_SIZE_L)
+    # Rope types such as yarn scale cos/sin by an attention factor; llama3 and
+    # default RoPE use 1.0.
+    cos = (cos * ATTN_SCALING).to(dtype_tl)
+    sin = (sin * ATTN_SCALING).to(dtype_tl)
 
     xb_rope_0 = xb_0 * cos - xb_1 * sin
     xb_rope_1 = xb_1 * cos + xb_0 * sin
@@ -132,13 +158,25 @@ def _abx_fwd(
     tl.store(O_ptrs, abx[None, :], mask=ls_mask[None, :])
 
 
-def abx(a: torch.Tensor, b: torch.Tensor, x: torch.Tensor, dtype=torch.float16) -> torch.Tensor:
+def abx(a: torch.Tensor, b: torch.Tensor, x: torch.Tensor,
+        ranks: torch.Tensor = None, inv_freq: torch.Tensor = None,
+        attn_scaling: float = 1.0, dtype=torch.float16) -> torch.Tensor:
     """Fused A @ (B @ X^T + RoPE) for decode-step attention.
 
     Args:
         a: query states, shape (batch, num_heads, 1, head_dim)
-        b: K projection U^T, shape (num_heads, rank_per_group, head_dim)
-        x: compressed K cache, shape (batch, num_groups, seq_len, rank_per_group)
+        b: K projection U^T, shape (num_kv_heads, max_rank, head_dim)
+        x: compressed K cache, shape (batch, num_groups, seq_len, max_rank)
+        ranks: int32 tensor (num_groups,), real rank kept per KV head. Entries
+               past ranks[h] must be zero in b and x. None means every head
+               uses the full padded rank (the old uniform behaviour).
+        inv_freq: RoPE inverse frequencies, shape (head_dim // 2,). Pass the
+               model's own `model.model.rotary_emb.inv_freq` -- it already
+               encodes the rope type (llama3/yarn/linear/...). None falls back
+               to default RoPE with theta=10000, which is WRONG for any model
+               using a different theta or a scaled rope type.
+        attn_scaling: cos/sin multiplier (rotary_emb.attention_scaling); 1.0
+               for default and llama3 RoPE.
         dtype: compute dtype (float16 or bfloat16)
 
     Returns:
@@ -151,8 +189,25 @@ def abx(a: torch.Tensor, b: torch.Tensor, x: torch.Tensor, dtype=torch.float16) 
     # a is per query head (num_heads); b is per KV head (num_groups). Keep them
     # distinct — do NOT let b's head count clobber num_heads (breaks GQA grids).
     batch_size, num_heads, _, head_dim = a.shape
-    _num_kv_heads, rank_per_head_groups, head_dim = b.shape
-    batch_size, num_groups, seq_len, rank_per_head_groups = x.shape
+    _num_kv_heads, max_rank, head_dim = b.shape
+    batch_size, num_groups, seq_len, max_rank = x.shape
+
+    if ranks is None:
+        ranks = torch.full((num_groups,), max_rank, dtype=torch.int32, device=x.device)
+    else:
+        assert ranks.numel() == num_groups, (
+            f"ranks has {ranks.numel()} entries but x has {num_groups} KV groups"
+        )
+        ranks = ranks.to(device=x.device, dtype=torch.int32).contiguous()
+
+    if inv_freq is None:
+        # Default RoPE, theta=10000. Only correct for models that actually use it.
+        i = torch.arange(0, head_dim // 2, dtype=torch.float32, device=x.device)
+        inv_freq = 1.0 / (10000.0 ** (i * 2 / head_dim))
+    inv_freq = inv_freq.to(device=x.device, dtype=torch.float32).contiguous()
+    assert inv_freq.numel() == head_dim // 2, (
+        f"inv_freq has {inv_freq.numel()} entries, expected head_dim//2 = {head_dim // 2}"
+    )
 
     out = torch.empty((batch_size, num_heads, 1, seq_len), dtype=x.dtype, device=x.device)
     BLOCK_SIZE_D = 64
@@ -169,37 +224,44 @@ def abx(a: torch.Tensor, b: torch.Tensor, x: torch.Tensor, dtype=torch.float16) 
 
     grid = lambda META: (batch_size, num_heads, triton.cdiv(seq_len, META["BLOCK_SIZE_L"]))
     _abx_fwd[grid](
-        a, b, x, out,
+        a, b, x, out, ranks, inv_freq,
         a.stride(0), a.stride(1), a.stride(2), a.stride(3),
         b.stride(0), b.stride(1), b.stride(2),
         x.stride(0), x.stride(1), x.stride(2), x.stride(3),
         out.stride(0), out.stride(1), out.stride(2), out.stride(3),
-        R=rank_per_head_groups,
         D=head_dim,
         seq_len=seq_len,
         dtype_tl=dtype_tl,
         BLOCK_SIZE_D=BLOCK_SIZE_D,
         NUM_GROUPS=NUM_GROUPS,
         GROUP_SIZE=GROUP_SIZE,
-        THETA=10000.,
+        ATTN_SCALING=float(attn_scaling),
     )
     return out
 
 
 def torch_abx(a, b, x, dtype=torch.float16):
-    """Reference PyTorch implementation of the fused ABX+RoPE operation."""
-    x_expand = x.unsqueeze(2)
-    b_reshape = b.reshape(-1, b.shape[0] // x.shape[1], b.shape[-2], b.shape[-1]).unsqueeze(0)
-    xb = x_expand @ b_reshape
-    xb = xb.reshape(x.shape[0], b.shape[0], -1, b.shape[-1])
+    """Reference PyTorch implementation of the fused ABX+RoPE operation.
+
+    Shapes match the kernel: b and x are indexed per KV head, a per query head,
+    and query head h reads KV head h // (num_q_heads // num_kv_heads).
+    """
+    batch, num_q_heads, _, head_dim = a.shape
+    num_kv_heads = x.shape[1]
+    group_size = num_q_heads // num_kv_heads
+
+    # Reconstruct full K per KV head: (batch, num_kv_heads, seq_len, head_dim)
+    xb = x.float() @ b.float().unsqueeze(0)
 
     config = LlamaConfig()
-    rotary_emb = LlamaRotaryEmbedding(config=config)
-    position_ids = torch.arange(0, x.shape[-2]).unsqueeze(0)
+    rotary_emb = LlamaRotaryEmbedding(config=config).to(xb.device)
+    position_ids = torch.arange(0, x.shape[-2], device=xb.device).unsqueeze(0)
     cos, sin = rotary_emb(xb, position_ids)
     xb_rope = apply_rotary_pos_emb_custom(x=xb, cos=cos, sin=sin)
-    axb = a @ xb_rope.transpose(-1, -2).to(dtype)
-    return axb
+
+    # Broadcast each KV head across the query heads that share it (GQA).
+    xb_rope = xb_rope.repeat_interleave(group_size, dim=1)
+    return (a.float() @ xb_rope.transpose(-1, -2)).to(dtype)
 
 
 def run_benchmark(args):
@@ -261,14 +323,35 @@ def run_test(args):
     dtype = torch.float16
     device = "cuda"
 
+    # B and X are per KV head (num_groups), A is per query head (num_heads).
     A = torch.randn(batch_size, num_heads, 1, head_dim, dtype=dtype, device=device)
-    B = torch.randn(num_heads, rank_per_groups, head_dim, dtype=dtype, device=device)
+    B = torch.randn(num_groups, rank_per_groups, head_dim, dtype=dtype, device=device)
     X = torch.randn(batch_size, num_groups, seq_len, rank_per_groups, dtype=dtype, device=device)
 
     axb = torch_abx(A, B, X, dtype)
     ours = abx(A, B, X, dtype=dtype)
 
-    print("Mean diff: ", torch.mean(torch.abs(axb - ours)))
+    denom = axb.float().abs().mean().clamp_min(1e-6)
+    print(f"Mean abs diff vs torch reference: {(axb - ours).float().abs().mean().item():.4f} "
+          f"(mean |ref| = {denom.item():.4f})")
+
+    # Per-head dynamic rank must be bit-identical to running at full padded rank,
+    # since everything past ranks[h] is zero in both B and X.
+    print("\nPer-head dynamic rank vs full-rank (padded tail zeroed):")
+    torch.manual_seed(0)
+    ranks = torch.randint(8, rank_per_groups + 1, (num_groups,), dtype=torch.int32)
+    Bd = torch.randn(num_groups, rank_per_groups, head_dim, dtype=dtype, device=device)
+    Xd = torch.randn(batch_size, num_groups, seq_len, rank_per_groups, dtype=dtype, device=device)
+    for h in range(num_groups):
+        Bd[h, ranks[h]:, :] = 0
+        Xd[:, h, :, ranks[h]:] = 0
+
+    full = abx(A, Bd, Xd, dtype=dtype)
+    dyn = abx(A, Bd, Xd, ranks=ranks, dtype=dtype)
+    max_diff = (full.float() - dyn.float()).abs().max().item()
+    print(f"  ranks    : {ranks.tolist()}  (padded to {rank_per_groups})")
+    print(f"  max diff : {max_diff:.3e}")
+    print("  PASS" if max_diff == 0.0 else "  FAIL (expected bit-exact)")
 
 
 def parse_args():

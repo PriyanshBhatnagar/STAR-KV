@@ -3,14 +3,17 @@
 Uses headwise decomposition for K and joint decomposition for V, with learnable
 soft-threshold mechanism that finds optimal ranks during training.
 
-Training runs in three phases:
+Training runs in two phases, then fuses:
   Phase 1: KD loss + compression loss, alpha LR active.
            Ends when the desired KV compression budget is reached (see
            --desired-comp-rate), with --alpha-samples as a step-count fallback.
-  Phase 2 (remaining steps):       KD loss only for recovery.
-  Phase 3 (--phase3-samples steps): Sigma fused into V (fixed rank), KD-only minor fine-tune
-                                    of fused U/VS modules.  Saved to --output-fused.
-                                    Weights load directly into latency.py Triton setup.
+  Phase 2 (remaining steps): KD loss only for recovery.
+  Fusion:  Sigma is baked into V and reduced to its binary keep-mask, then the
+           result is saved to --output.  This is the ONLY artifact produced --
+           use it for both accuracy eval and latency benchmarking.
+  Phase 3 (optional, --phase3-samples > 0): extra KD-only fine-tune of the
+           already-fused model, overwriting --output.  Fusion is numerically
+           exact, so this is pure additional recovery, not a correction.
 
 Compression budget
 ------------------
@@ -21,8 +24,8 @@ Compression budget
 
 Example
 -------
-  python train.py --model meta-llama/Llama-3.1-8B-Instruct --output trained_weights.pt --output-fused fused_weights.pt --epochs 1 --lr 2e-5 --seq-len 4096 --num-samples 3500 --alpha-lr 1e-2 --alpha-samples 2500 --comp-weight-k 0.1 --comp-weight-v 0.1 --kd-weight 1.0 --desired-comp-rate 0.6 --phase3-samples 200
-  python train.py --model meta-llama/Llama-3.2-3B  --output trained_weights.pt --output-fused fused_weights.pt --epochs 1 --lr 2e-5 --seq-len 4096 --num-samples 4000 --alpha-lr 1e-2 --alpha-samples 3000 --comp-weight-k 0.1 --comp-weight-v 0.1 --kd-weight 1.0 --desired-comp-rate 0.6 --phase3-samples 200
+  python train.py --model meta-llama/Llama-3.1-8B-Instruct --output fused_weights.pt --epochs 1 --lr 2e-5 --seq-len 4096 --num-samples 3500 --alpha-lr 1e-2 --alpha-samples 2500 --comp-weight-k 0.1 --comp-weight-v 0.1 --kd-weight 1.0 --desired-comp-rate 0.6
+  python train.py --model meta-llama/Llama-3.2-3B  --output fused_weights.pt --epochs 1 --lr 2e-5 --seq-len 4096 --num-samples 4000 --alpha-lr 1e-2 --alpha-samples 3000 --comp-weight-k 0.1 --comp-weight-v 0.1 --kd-weight 1.0 --desired-comp-rate 0.6
   """
 
 
@@ -125,14 +128,21 @@ def comp_loss_v(model):
 @torch.no_grad()
 def _fuse_sigma_into_v_inplace(model, skip_layers):
     """Multiply soft-thresholded Sigma diagonal into V.weight for every
-    DecomposeLinear / DecomposeLinear_headwise layer, then reset Sigma to
-    identity (diag=1, alpha=0) and freeze it.
+    DecomposeLinear / DecomposeLinear_headwise layer, then reduce Sigma to the
+    binary keep-mask (1 for surviving ranks, 0 for pruned), alpha=0, and freeze.
 
-    After this call the existing U(S(V(x))) forward is numerically U(V_new(x))
-    because S is identity.  The model structure stays as-is (LlamaForCausalLM
-    with DecomposeLinear modules), so latency.py can still call
-    replace_attn_with_triton on the saved weights — export_kproj/vproj_for_triton
-    read diag=1, alpha=0 and produce VS = V_new * 1 = V_new, which is correct.
+    Sigma must NOT be filled with all-ones here.  Fusing zeroes the pruned rows
+    of V, but the rank bookkeeping lives in Sigma: export_kproj/vproj_for_triton
+    select surviving ranks with `keep = diag > alpha`.  An all-ones diagonal
+    makes that predicate true for every rank, so export silently emits a
+    full-rank (zero-padded) cache and the KV compression is lost — invisibly,
+    since the forward stays numerically correct either way.
+
+    Writing the keep-mask instead keeps `diag > alpha` selecting exactly the
+    surviving ranks, and soft_thres_layer(1.0) with alpha=0 is tanh(50) == 1.0,
+    so S remains an exact identity on kept ranks.  It also holds the pruning
+    during any later fine-tune: gradient into a pruned V row is scaled by
+    s_i = 0, so rows zeroed here stay zeroed.
     """
     skip = set(skip_layers)
     for i, block in enumerate(model.model.layers):
@@ -144,12 +154,11 @@ def _fuse_sigma_into_v_inplace(model, skip_layers):
         vp = attn.v_proj
         if isinstance(vp, DecomposeLinear):
             diag = vp.Sigma.diag.detach().float()
-            alpha = float(vp.Sigma.soft_thres_layer.alpha)
-            s_eff = (diag - alpha).clamp_min_(0)
+            s_eff = vp.Sigma.soft_thres_layer(diag)
             vp.V.weight.data = (vp.V.weight.detach().float() * s_eff[:, None]).to(
                 vp.V.weight.dtype
             )
-            vp.Sigma.diag.data.fill_(1.0)
+            vp.Sigma.diag.data.copy_((s_eff > 0).to(vp.Sigma.diag.dtype))
             vp.Sigma.soft_thres_layer.alpha.data.fill_(0.0)
             vp.Sigma.diag.requires_grad_(False)
             vp.Sigma.soft_thres_layer.alpha.requires_grad_(False)
@@ -157,29 +166,47 @@ def _fuse_sigma_into_v_inplace(model, skip_layers):
         # ── k_proj: DecomposeLinear_headwise (per-head Sigma_blocks) ─────────
         kp = attn.k_proj
         if isinstance(kp, DecomposeLinear_headwise):
+            # Enforce the block-diagonal structure of U before fusing. New runs
+            # keep it via MaskedLinear's mask, but checkpoints trained before
+            # that mask existed carry cross-head entries which the Triton export
+            # drops -- zeroing them here keeps the saved model identical to the
+            # one that actually gets deployed.
+            if hasattr(kp, "Sigma_blocks") and getattr(kp, "_r_list", None):
+                Hd = kp._head_dim
+                keep_mask = torch.zeros_like(kp.U.weight)
+                row = col = 0
+                for r_h in kp._r_list:
+                    keep_mask[row:row + Hd, col:col + r_h] = 1.0
+                    row += Hd
+                    col += r_h
+                dropped = (kp.U.weight.detach().float() * (1 - keep_mask.float())).norm()
+                total = kp.U.weight.detach().float().norm()
+                if total > 0 and (dropped / total) > 0.05:
+                    print(f"  [fuse] layer {i}: dropping {100 * dropped / total:.2f}% of "
+                          f"U energy outside the per-head blocks")
+                kp.U.weight.data.mul_(keep_mask)
+
             if hasattr(kp, "Sigma_blocks"):
                 col = 0
                 for sb in kp.Sigma_blocks:
                     r_h = sb.diag.numel()
                     diag = sb.diag.detach().float()
-                    alpha = float(sb.soft_thres_layer.alpha)
-                    s_eff = (diag - alpha).clamp_min_(0)
+                    s_eff = sb.soft_thres_layer(diag)
                     kp.V.weight.data[col:col + r_h] = (
                         kp.V.weight.detach()[col:col + r_h].float() * s_eff[:, None]
                     ).to(kp.V.weight.dtype)
-                    sb.diag.data.fill_(1.0)
+                    sb.diag.data.copy_((s_eff > 0).to(sb.diag.dtype))
                     sb.soft_thres_layer.alpha.data.fill_(0.0)
                     sb.diag.requires_grad_(False)
                     sb.soft_thres_layer.alpha.requires_grad_(False)
                     col += r_h
             else:
                 diag = kp.Sigma.diag.detach().float()
-                alpha = float(kp.Sigma.soft_thres_layer.alpha)
-                s_eff = (diag - alpha).clamp_min_(0)
+                s_eff = kp.Sigma.soft_thres_layer(diag)
                 kp.V.weight.data = (kp.V.weight.detach().float() * s_eff[:, None]).to(
                     kp.V.weight.dtype
                 )
-                kp.Sigma.diag.data.fill_(1.0)
+                kp.Sigma.diag.data.copy_((s_eff > 0).to(kp.Sigma.diag.dtype))
                 kp.Sigma.soft_thres_layer.alpha.data.fill_(0.0)
                 kp.Sigma.diag.requires_grad_(False)
                 kp.Sigma.soft_thres_layer.alpha.requires_grad_(False)
@@ -197,8 +224,9 @@ def parse_args():
                    help="HuggingFace dataset name for training")
     p.add_argument("--dataset-config", default="sample-10BT",
                    help="Dataset configuration/subset name (e.g. 'sample-10BT' for fineweb-edu)")
-    p.add_argument("--output", default="trained_weights.pt",
-                   help="Path to save the best checkpoint")
+    p.add_argument("--output", default="fused_weights.pt",
+                   help="Path to save the final FUSED checkpoint (Sigma baked into V). "
+                        "This is the only artifact produced; use it for both eval and latency.")
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--batch-size", type=int, default=1)
     p.add_argument("--lr", type=float, default=2e-5, help="Learning rate for non-alpha params")
@@ -228,10 +256,10 @@ def parse_args():
                    help="Attention layer indices to leave uncompressed")
     p.add_argument("--log-steps", type=int, default=100,
                    help="Print training stats and save checkpoint every N steps")
-    p.add_argument("--phase3-samples", type=int, default=200,
-                   help="KD-only fine-tune steps after Sigma is fused into V (0 to skip)")
-    p.add_argument("--output-fused", default="fused_weights.pt",
-                   help="Path to save the best Phase 3 fused checkpoint")
+    p.add_argument("--phase3-samples", type=int, default=0,
+                   help="Optional KD-only fine-tune steps AFTER Sigma is fused into V. "
+                        "0 (default) skips it; fusion is exact, so this is pure extra "
+                        "recovery, not a correction. Result overwrites --output.")
     p.add_argument("--wandb-project", default=None,
                    help="Weights & Biases project name (omit to disable W&B)")
     p.add_argument("--cuda-devices", default="0,1",
@@ -369,6 +397,9 @@ def main():
     )
 
     # ── Training loop ────────────────────────────────────────────────────────
+    # Phase 1/2 best-so-far lands here (still unfused); it is fused into
+    # args.output once training ends, then deleted. Not a user-facing artifact.
+    staging_path = args.output + ".phase12.tmp"
     best_loss = float("inf")
     phase2_entered = False
     k_frozen = False  # K budget reached; K comp loss dropped
@@ -530,21 +561,31 @@ def main():
 
                 if loss.item() < best_loss:
                     best_loss = loss.item()
-                    torch.save(model.state_dict(), args.output)
-                    pbar.write(f"  Saved checkpoint → {args.output}")
+                    torch.save(model.state_dict(), staging_path)
+                    pbar.write(f"  Saved checkpoint → {staging_path}")
 
         print(f"Epoch {epoch + 1} done. Best loss: {best_loss:.4f}")
 
-    print(f"Training complete. Best Phase 1/2 checkpoint saved to: {args.output}")
+    print(f"Training complete. Best Phase 1/2 loss: {best_loss:.4f}")
 
-    # ── Phase 3: fuse Sigma into V, fine-tune fused U/VS with KD only ────────
+    # ── Fuse Sigma into V, then save the single final artifact ───────────────
+    # The in-memory model sits at the LAST step, not the best one, so restore
+    # the best Phase 1/2 state before fusing.
+    raw_model = accelerator.unwrap_model(model)
+    if os.path.exists(staging_path):
+        print(f"Restoring best Phase 1/2 state from {staging_path}...")
+        raw_model.load_state_dict(
+            torch.load(staging_path, map_location="cpu", weights_only=False), strict=False
+        )
+
+    print("Fusing Sigma into V...")
+    _fuse_sigma_into_v_inplace(raw_model, args.skip_layers)
+    torch.save(raw_model.state_dict(), args.output)
+    print(f"Fused checkpoint → {args.output}")
+
+    # ── Phase 3 (optional): further KD-only fine-tune of the fused model ─────
     if args.phase3_samples > 0:
-        print("\nPhase 3: fusing Sigma into V and fine-tuning with KD loss (pure PyTorch, no Triton)...")
-
-        # Fuse Sigma into V in-place; model stays as LlamaForCausalLM with
-        # DecomposeLinear modules — no Triton, no custom attention during training.
-        raw_model = accelerator.unwrap_model(model)
-        _fuse_sigma_into_v_inplace(raw_model, args.skip_layers)
+        print("\nPhase 3: fine-tuning the fused model with KD loss (pure PyTorch, no Triton)...")
 
         # New optimizer — as old one references now-gone U/S/V params.
         p3_optimizer = torch.optim.AdamW(
@@ -620,13 +661,14 @@ def main():
 
             if loss.item() < best_p3_loss:
                 best_p3_loss = loss.item()
-                torch.save(raw_model.state_dict(), args.output_fused)
-                pbar3.write(
-                    f"  [phase3] Saved best fused checkpoint → {args.output_fused}"
-                )
+                torch.save(raw_model.state_dict(), args.output)
+                pbar3.write(f"  [phase3] Saved fused checkpoint → {args.output}")
 
         print(f"Phase 3 done. Best fused loss: {best_p3_loss:.4f}")
-        print(f"Fused checkpoint (U/VS, loadable by latency.py) → {args.output_fused}")
+
+    if os.path.exists(staging_path):
+        os.remove(staging_path)
+    print(f"\nFinal fused checkpoint → {args.output}")
 
     if wandb_run:
         wandb_run.finish()

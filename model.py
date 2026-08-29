@@ -24,7 +24,21 @@ from transformers.cache_utils import Cache
 import LlamaLoRaAttention_headwise as attn_module
 from LlamaLoRaAttention_headwise import LlamaCustomAttention
 from LlamaLoRaAttention_headwise import apply_rotary_pos_emb_custom as _rope
+from transformers.models.llama.modeling_llama import rotate_half
 from soft_thres_layer import soft_thres_layer
+
+
+def _rope_tables(inv_freq, seq_len, device, dtype, attn_scaling=1.0):
+    """cos/sin covering absolute positions 0..seq_len-1, shaped [seq_len, head_dim].
+
+    Needed wherever RoPE is applied to the whole cached K at once: the model's
+    position_embeddings only cover the current query position, and reusing that
+    single rotation for every cached key erases relative position entirely.
+    """
+    pos = torch.arange(seq_len, device=device, dtype=torch.float32)
+    freqs = pos[:, None] * inv_freq.to(device=device, dtype=torch.float32)[None, :]
+    emb = torch.cat([freqs, freqs], dim=-1)
+    return (emb.cos() * attn_scaling).to(dtype), (emb.sin() * attn_scaling).to(dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +130,20 @@ class DecomposeLinear_headwise(nn.Module):
             for r_h, mod in zip(self._r_list, self.Sigma_blocks):
                 mod.set_value(Sigma[offset:offset + r_h].to(cur_device))
                 offset += r_h
+
+            # Constrain U to be block-diagonal: head h's output rows may only
+            # read head h's rank block. The SVD initialises it that way, but
+            # without this mask training fills the off-block entries with
+            # cross-head mixing that a headwise decomposition cannot express --
+            # export_kproj_for_triton slices per head and silently drops it,
+            # so the deployed model diverges from the trained one.
+            head_mask = torch.zeros(self.out_features, self.rank, device=cur_device)
+            row = col = 0
+            for r_h in self._r_list:
+                head_mask[row:row + self._head_dim, col:col + r_h] = 1.0
+                row += self._head_dim
+                col += r_h
+            self.U.set_mask(head_mask)
         else:
             self.Sigma = DiagonalLinear(self.rank, 0.0).to(cur_device)
             self.Sigma.set_value(Sigma.to(cur_device))
@@ -144,6 +172,10 @@ class DecomposeLinear_headwise(nn.Module):
         if Out % Hd != 0:
             self._r_list = None
             return torch.linalg.svd(W, full_matrices=False)
+
+        # Persist the resolved head_dim: it may have been derived from
+        # _num_heads above, and the U block mask / Triton export both need it.
+        self._head_dim = Hd
 
         H = Out // Hd
         W_heads = W.view(H, Hd, In)
@@ -205,9 +237,26 @@ class DecomposeLinear(nn.Module):
 # Model surgery
 # ---------------------------------------------------------------------------
 
-def replace_linear_layer(model, config, skip_layers: tuple = (0, 1, 31)):
+def replace_linear_layer(model, config, skip_layers: tuple = (0, 1, 31),
+                         init_svd: bool = True):
     """Replace k_proj with DecomposeLinear_headwise and v_proj with DecomposeLinear
-    for all transformer layers not in skip_layers."""
+    for all transformer layers not in skip_layers.
+
+    init_svd=False skips the SVD factorisation and leaves U/Sigma/V zeroed,
+    keeping only the shapes (which is all that sets the per-head rank list).
+    Use it when a checkpoint is loaded immediately afterwards -- load_state_dict
+    overwrites every factor anyway, and the SVD costs ~15 minutes on CPU for a
+    3B model. Training must keep the default, since it starts from the SVD.
+    """
+    if not init_svd:
+        _real_svd = torch.linalg.svd
+
+        def _shape_only_svd(W, full_matrices=False):
+            out_f, in_f = W.shape
+            k = min(out_f, in_f)
+            return W.new_zeros(out_f, k), W.new_zeros(k), W.new_zeros(k, in_f)
+
+        torch.linalg.svd = _shape_only_svd
 
     def _helper(module):
         for name, child in module.named_children():
@@ -227,9 +276,13 @@ def replace_linear_layer(model, config, skip_layers: tuple = (0, 1, 31)):
             else:
                 _helper(child)
 
-    for i, block in enumerate(model.model.layers):
-        if i not in set(skip_layers):
-            _helper(block)
+    try:
+        for i, block in enumerate(model.model.layers):
+            if i not in set(skip_layers):
+                _helper(block)
+    finally:
+        if not init_svd:
+            torch.linalg.svd = _real_svd
 
 
 # ---------------------------------------------------------------------------
@@ -287,11 +340,24 @@ def collect_KV_parameter_size(model, equal: bool = False) -> int:
 def export_kproj_for_triton(
     decomp: DecomposeLinear_headwise,
     dtype: torch.dtype = torch.bfloat16,
-) -> Tuple[nn.Linear, torch.Tensor]:
-    """Fold soft-thresholded S into V per head; return (VS_linear, U_tensor).
+) -> Tuple[nn.Linear, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fold soft-thresholded S into V per head.
 
-    VS_linear : nn.Linear  [H * min_rank, in_features]
-    U_tensor  : Tensor     [H, head_dim, min_rank]
+    Returns (VS_linear, U_tensor, dense_weight, ranks).
+
+    Heads keep different numbers of singular directions. Storage is padded up
+    to the longest head's rank so strides stay uniform (padded rows/cols are
+    zero, so this is exact), and `ranks` carries each head's real rank so the
+    decode kernel can stop early instead of grinding through the zero padding.
+
+    dense_weight is U @ VS reconstructed back to the original [out, in] shape,
+    computed once here so prefill can do a single full-size matmul (matching
+    the uncompressed baseline's cost) instead of reconstructing per token.
+
+    VS_linear   : nn.Linear  [H * max_rank, in_features]
+    U_tensor    : Tensor     [H, head_dim, max_rank]
+    dense_weight: Tensor     [H * head_dim, in_features]
+    ranks       : Tensor     [H]  int32, real rank kept per head
     """
     device = decomp.U.weight.device
     H = len(decomp._r_list)
@@ -310,30 +376,47 @@ def export_kproj_for_triton(
         keep = (diag > alpha).nonzero(as_tuple=False).view(-1)
         if keep.numel() == 0:
             keep = torch.zeros(1, dtype=torch.long, device=device)
-        s_vals = (diag[keep] - alpha).clamp_min(0)
+        s_vals = sig.soft_thres_layer(diag[keep])
         cols = col_off + keep
         VS_list.append(V_w[cols] * s_vals[:, None])
         U_list.append(U_w[h * Hd:(h + 1) * Hd][:, cols])
         col_off += r_h
 
-    min_r = min(v.shape[0] for v in VS_list)
-    VS_cat = torch.cat([v[:min_r] for v in VS_list], dim=0).to(dtype)
-    U_ten = torch.stack([u[:, :min_r] for u in U_list], dim=0).to(dtype)
+    # Real rank per head, captured before padding — this is what lets the decode
+    # kernel skip the zero padding instead of computing through it.
+    ranks = torch.tensor([v.shape[0] for v in VS_list], dtype=torch.int32, device=device)
 
-    VS_lin = nn.Linear(decomp.in_features, H * min_r, bias=False).to(device=device, dtype=dtype)
+    max_r = max(v.shape[0] for v in VS_list)
+    VS_list = [F.pad(v, (0, 0, 0, max_r - v.shape[0])) for v in VS_list]
+    U_list = [F.pad(u, (0, max_r - u.shape[1])) for u in U_list]
+    VS_cat = torch.cat(VS_list, dim=0).to(dtype)
+    U_ten = torch.stack(U_list, dim=0).to(dtype)
+
+    VS_lin = nn.Linear(decomp.in_features, H * max_r, bias=False).to(device=device, dtype=dtype)
     VS_lin.weight = nn.Parameter(VS_cat.to(device))
-    return VS_lin, U_ten.to(device)
+
+    # dense_weight[h] = U_ten[h] @ VS_cat[h] reconstructs the original [head_dim, in] block
+    dense_weight = torch.einsum(
+        "hdr,hri->hdi", U_ten.float(), VS_cat.view(H, max_r, -1).float()
+    ).reshape(H * Hd, -1).to(dtype).to(device)
+
+    return VS_lin, U_ten.to(device), dense_weight, ranks
 
 
 @torch.no_grad()
 def export_vproj_for_triton(
     decomp: DecomposeLinear,
     dtype: torch.dtype = torch.bfloat16,
-) -> Tuple[nn.Linear, nn.Linear]:
-    """Fold soft-thresholded S into V; return (VS_linear, U_linear).
+) -> Tuple[nn.Linear, nn.Linear, torch.Tensor]:
+    """Fold soft-thresholded S into V; return (VS_linear, U_linear, dense_weight).
 
-    VS_linear : nn.Linear  [rank, in_features]
-    U_linear  : nn.Linear  [out_features, rank]
+    dense_weight = U @ VS reconstructed back to [out_features, in_features],
+    computed once here so prefill can do a single full-size matmul instead of
+    reconstructing per token.
+
+    VS_linear   : nn.Linear  [rank, in_features]
+    U_linear    : nn.Linear  [out_features, rank]
+    dense_weight: Tensor     [out_features, in_features]
     """
     device = decomp.U.weight.device
     U_w = decomp.U.weight.detach().float()
@@ -345,7 +428,7 @@ def export_vproj_for_triton(
     keep = (diag > alpha).nonzero(as_tuple=False).view(-1)
     if keep.numel() == 0:
         keep = torch.zeros(1, dtype=torch.long, device=device)
-    s_vals = (diag[keep] - alpha).clamp_min(0)
+    s_vals = sig.soft_thres_layer(diag[keep])
 
     VS = (V_w[keep] * s_vals[:, None]).to(dtype)
     U_pruned = U_w[:, keep].to(dtype)
@@ -355,7 +438,9 @@ def export_vproj_for_triton(
     U_lin = nn.Linear(rk, decomp.out_features, bias=False).to(device=device, dtype=dtype)
     VS_lin.weight = nn.Parameter(VS.to(device))
     U_lin.weight = nn.Parameter(U_pruned.to(device))
-    return VS_lin, U_lin
+
+    dense_weight = (U_pruned.float() @ VS.float()).to(dtype).to(device)
+    return VS_lin, U_lin, dense_weight
 
 
 # ---------------------------------------------------------------------------
@@ -363,21 +448,25 @@ def export_vproj_for_triton(
 # ---------------------------------------------------------------------------
 
 class KProjInferenceWrapper(nn.Module):
-    """Wraps exported k_proj so LlamaCustomAttention can access .VS and .U."""
+    """Wraps exported k_proj so LlamaCustomAttention can access .VS, .U, .dense_weight, .ranks."""
 
-    def __init__(self, VS_linear: nn.Linear, U_tensor: torch.Tensor):
+    def __init__(self, VS_linear: nn.Linear, U_tensor: torch.Tensor,
+                 dense_weight: torch.Tensor, ranks: torch.Tensor):
         super().__init__()
         self.VS = VS_linear
         self.register_buffer("U", U_tensor)
+        self.register_buffer("dense_weight", dense_weight)
+        self.register_buffer("ranks", ranks)
 
 
 class VProjInferenceWrapper(nn.Module):
-    """Wraps exported v_proj so LlamaCustomAttention can access .VS and .U."""
+    """Wraps exported v_proj so LlamaCustomAttention can access .VS, .U, .dense_weight."""
 
-    def __init__(self, VS_linear: nn.Linear, U_linear: nn.Linear):
+    def __init__(self, VS_linear: nn.Linear, U_linear: nn.Linear, dense_weight: torch.Tensor):
         super().__init__()
         self.VS = VS_linear
         self.U = U_linear
+        self.register_buffer("dense_weight", dense_weight)
 
 
 # ---------------------------------------------------------------------------
@@ -427,38 +516,70 @@ def _patched_attn_forward(
     Hd = self.head_dim
 
     if query_len > 1:
-        # Prefill: materialise full K/V and use SDPA (Flash Attention path)
-        key_full = torch.matmul(key_states, k_u.transpose(-2, -1).to(key_states.dtype))
-        key_full = _rope(key_full, cos, sin)
-        # GQA: key_full has num_key_value_heads (8); query has num_attention_heads
-        # (24). Expand K to match Q so SDPA head dims line up. For MHA models
-        # (num_key_value_groups == 1) this is a no-op.
-        key_full = key_full.repeat_interleave(self.num_key_value_groups, dim=1)
-        value_full = (
-            torch.matmul(value_states, v_u.weight.T)
-            .view(*value_states.shape[:-1], H, Hd)
-            .transpose(-3, -2)
+        # Prefill: same cost as the uncompressed baseline. Use the dense
+        # U@VS reconstruction (computed once at export time, not per token)
+        # directly on hidden_states, instead of round-tripping through the
+        # compact cache representation. The compact k_inter/v_inter computed
+        # above still get written to past_key_values regardless, so decode
+        # continues from that low-rank latent cache as usual. Only valid for
+        # single-shot (non-chunked) prefill, i.e. hidden_states covers the
+        # whole new segment with no pre-existing cache mixed in.
+        key_full = (
+            F.linear(hidden_states, self.k_proj.dense_weight)
+            .view(*input_shape, H, Hd)
+            .transpose(1, 2)
         )
-        value_full = value_full.repeat_interleave(self.num_key_value_groups, dim=1)
+        key_full = _rope(key_full, cos, sin)
+        value_full = (
+            F.linear(hidden_states, self.v_proj.dense_weight)
+            .view(*input_shape, H, Hd)
+            .transpose(1, 2)
+        )
         causal_mask = (
             attention_mask[:, :, :, : key_states.shape[-2]]
             if attention_mask is not None else None
         )
-        attn_output = F.scaled_dot_product_attention(
-            query_states, key_full, value_full, attn_mask=causal_mask, scale=self.scaling
-        )
+        if causal_mask is None:
+            # No padding: let SDPA broadcast the 8 KV heads against 24 query
+            # heads internally (flash/cuDNN native GQA), matching the
+            # uncompressed baseline instead of materialising a 3x-larger
+            # repeated K/V via repeat_interleave.
+            attn_output = F.scaled_dot_product_attention(
+                query_states, key_full, value_full, scale=self.scaling,
+                enable_gqa=True, is_causal=True,
+            )
+        else:
+            key_full = key_full.repeat_interleave(self.num_key_value_groups, dim=1)
+            value_full = value_full.repeat_interleave(self.num_key_value_groups, dim=1)
+            attn_output = F.scaled_dot_product_attention(
+                query_states, key_full, value_full, attn_mask=causal_mask, scale=self.scaling
+            )
     else:
         # Decode: fused Triton kernel or standard QK^T
         if attn_module.triton_kernel:
+            # inv_freq/attn_scaling come from the model's own rotary embedding,
+            # so the RoPE the kernel applies to K matches the one applied to Q
+            # above for every rope type (llama3, yarn, linear, ...).
             attn_weights = _abx(
                 query_states,
                 k_u.transpose(-2, -1).contiguous(),
                 key_states.contiguous(),
+                ranks=self.k_proj.ranks,
+                inv_freq=self.rope_inv_freq,
+                attn_scaling=self.rope_attn_scaling,
                 dtype=torch.float16,
             ) / math.sqrt(self.head_dim)
         else:
             key_full = torch.matmul(key_states, k_u.transpose(-2, -1).to(key_states.dtype))
-            key_full = _rope(key_full, cos, sin)
+            # The cached keys span absolute positions 0..kv_len-1, but cos/sin
+            # from position_embeddings cover only the current query position.
+            # Rebuild the full tables rather than letting _rope fall back to
+            # broadcasting the last position's rotation over every cached key.
+            k_cos, k_sin = _rope_tables(
+                self.rope_inv_freq, key_full.shape[-2],
+                key_full.device, key_full.dtype, self.rope_attn_scaling,
+            )
+            key_full = key_full * k_cos + rotate_half(key_full) * k_sin
             # GQA: expand K from num_key_value_heads to num_attention_heads so it
             # matches query_states. No-op for MHA (num_key_value_groups == 1).
             key_full = key_full.repeat_interleave(self.num_key_value_groups, dim=1)
@@ -554,6 +675,17 @@ def replace_attn_with_triton(
     the unified prefill+decode forward in all non-skip layers."""
     num_heads = config.num_attention_heads
 
+    # The decode kernel re-derives RoPE for the cached K internally, so it needs
+    # the exact frequencies the model uses for Q. 
+    rotary = getattr(model.model, "rotary_emb", None)
+    if rotary is None or not hasattr(rotary, "inv_freq"):
+        raise RuntimeError(
+            "model.model.rotary_emb.inv_freq not found; the Triton decode kernel "
+            "needs it to apply RoPE consistently with the query path."
+        )
+    rope_inv_freq = rotary.inv_freq.detach().float()
+    rope_attn_scaling = float(getattr(rotary, "attention_scaling", 1.0))
+
     for i, block in enumerate(model.model.layers):
         if i in set(skip_layers):
             continue
@@ -568,19 +700,24 @@ def replace_attn_with_triton(
         new_attn.q_proj.weight.data.copy_(orig.q_proj.weight.data.to(dtype))
         new_attn.o_proj.weight.data.copy_(orig.o_proj.weight.data.to(dtype))
 
-        k_VS, k_U = export_kproj_for_triton(orig.k_proj, dtype=dtype)
-        new_attn.k_proj = KProjInferenceWrapper(k_VS, k_U)
+        k_VS, k_U, k_dense, k_ranks = export_kproj_for_triton(orig.k_proj, dtype=dtype)
+        new_attn.k_proj = KProjInferenceWrapper(k_VS, k_U, k_dense, k_ranks)
 
-        v_VS, v_U = export_vproj_for_triton(orig.v_proj, dtype=dtype)
-        new_attn.v_proj = VProjInferenceWrapper(v_VS, v_U)
+        v_VS, v_U, v_dense = export_vproj_for_triton(orig.v_proj, dtype=dtype)
+        new_attn.v_proj = VProjInferenceWrapper(v_VS, v_U, v_dense)
+
+        new_attn.register_buffer("rope_inv_freq", rope_inv_freq.to(device), persistent=False)
+        new_attn.rope_attn_scaling = rope_attn_scaling
 
         new_attn.forward = types.MethodType(_patched_attn_forward, new_attn)
         block.self_attn = new_attn
 
         if i == 2:
-            rk = k_VS.weight.shape[0] // num_heads
-            rv = v_VS.weight.shape[0]
-            print(f"  Layer {i}: k rank/head={rk}, v rank={rv}")
+            # Ranks are per KV head, not per query head -- dividing by
+            # num_attention_heads under-reports by the GQA group size.
+            rk = k_VS.weight.shape[0] // config.num_key_value_heads
+            print(f"  Layer {i}: k rank/kv-head max={rk} "
+                  f"(real per head: {k_ranks.tolist()}), v rank={v_VS.weight.shape[0]}")
 
     return model
 

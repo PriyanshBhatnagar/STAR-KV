@@ -33,8 +33,9 @@ Low-rank projection is a promising approach for compressing the KV cache because
 - [ ] Add trained weights file for LongChat, LLaMA-3.1-8B
 - [ ] Update citation reference
 - [ ] Add links for project page, arXiv, PMLR
-- [ ] Fix kernels for acc analysis
+- [x] Fix kernels for acc analysis
 - [x] ~~Pre-release of STAR-KV~~
+- [ ] Wire the quantized kernels (`bx_quant.py`, `*_quant.py`) into train/eval/latency
 
 ## Repository Structure
 
@@ -43,10 +44,11 @@ Low-rank projection is a promising approach for compressing the KV cache because
 ├── train.py                             # Training script (soft-threshold mechanism)
 ├── eval.py                              # Evaluation: PPL, zero-shot, LongBench, RULER
 ├── latency.py                           # Latency benchmarks: end-to-end and layer-wise
+├── check_compression.py                 # Report the KV compression encoded in a checkpoint
 ├── soft_thres_layer.py                  # Learnable soft-threshold function
 ├── LlamaLoRaAttention_headwise.py       # Low-rank attention module w/ Triton (no quantization)
 ├── LlamaLoRaAttention_headwise_quant.py # Low-rank attention module w/ Triton (int8/int4 KV cache)
-├── abx_rope_batched.py                  # Triton kernel: fused A@(B@X^T + RoPE) for K
+├── abx_rope_batched.py                  # Triton kernel: fused A@(B@X^T + RoPE) for K, per-head rank
 └── bx_quant.py                          # Triton kernel: fused dequant + B@X for V
 ```
 
@@ -80,15 +82,23 @@ pip install -r requirements.txt
 export HF_TOKEN="your_huggingface_token"   # for gated models (e.g. Llama-3)
 export WANDB_API_KEY="your_wandb_key"      # optional
 
-python train.py \\
---model meta-llama/Llama-3.1-8B-Instruct \\
---output trained_weights.pt --output-fused fused_weights.pt \\
---epochs 1 --lr 2e-5 --seq-len 8192 --num-samples 4000 \\
---alpha-lr 1e-2 --alpha-samples 3000 --comp-weight-k 0.1 --comp-weight-v 0.1 --kd-weight 1.0 \\
---desired-comp-rate 0.6 --phase3-samples 200
+python train.py \
+--model meta-llama/Llama-3.1-8B-Instruct \
+--output fused_weights.pt \
+--epochs 1 --lr 2e-5 --seq-len 8192 --num-samples 4000 \
+--alpha-lr 1e-2 --alpha-samples 3000 --comp-weight-k 0.1 --comp-weight-v 0.1 --kd-weight 1.0 \
+--desired-comp-rate 0.6
 ```
 
-Trains with knowledge distillation from the uncompressed teacher. The soft-threshold adaptively truncates singular values for both K and V projections. The best checkpoint is saved to `--output`.
+Trains with knowledge distillation from the uncompressed teacher. The soft-threshold adaptively truncates singular values for both K and V projections. After training, Sigma is fused into V and the result is written to `--output` — this fused checkpoint is the only artifact, and is used for both accuracy and latency evaluation.
+
+Optionally add `--phase3-samples N` for an extra KD-only fine-tune of the already-fused model (overwrites `--output`). Fusion is numerically exact, so this is pure additional recovery rather than a correction.
+
+To confirm the checkpoint actually carries the expected compression:
+
+```
+python check_compression.py --weights fused_weights.pt --per-layer
+```
 
 ### Evaluation
 
@@ -99,7 +109,7 @@ To evaluate perplexity on WikiText-2 and C4:
 ```
 python eval.py \
   --model lmsys/longchat-7b-v1.5-32k \
-  --weights trained_weights.pt \
+  --weights fused_weights.pt \
   --ppl --ppl-datasets wikitext2,c4
 ```
 
@@ -110,7 +120,7 @@ To run zero-shot evaluations on PIQA, WinoGrande, ARC, HellaSwag, and OpenBookQA
 ```
 python eval.py \
   --model lmsys/longchat-7b-v1.5-32k \
-  --weights trained_weights.pt \
+  --weights fused_weights.pt \
   --tasks piqa,winogrande,arc_easy,arc_challenge,openbookqa,hellaswag \
   --batch-size 32
 ```
@@ -122,11 +132,13 @@ To evaluate on LongBench and RULER:
 ```
 python eval.py \
   --model lmsys/longchat-7b-v1.5-32k \
-  --weights trained_weights.pt \
+  --weights fused_weights.pt \
   --longbench --ruler --max-length 31500
 ```
 
 To save all results to JSON, add `--output results/eval_results.json` to any of the above commands.
+
+Add `--baseline` (and drop `--weights`) to measure the uncompressed model for comparison. Add `--triton` to evaluate through the fused Triton attention — the same path `latency.py` benchmarks — instead of the pure-PyTorch reference; note perplexity runs prefill only, so `--triton` matters for the generation-based tasks rather than PPL.
 
 ### Latency Benchmarks
 
@@ -142,7 +154,7 @@ python latency.py \
 # Step 2: low-rank + Triton
 python latency.py \
   --model lmsys/longchat-7b-v1.5-32k \
-  --weights trained_weights.pt \
+  --weights fused_weights.pt \
   --mode e2e \
   --ctx-lens 256 512 1024 2048 4096 8192 16384 32000 64000 128000 \
   --output-dir results/
@@ -155,14 +167,17 @@ If `results/baseline_latency.json` is present when running the low-rank benchmar
 ```
 python latency.py \
   --model lmsys/longchat-7b-v1.5-32k \
-  --weights trained_weights.pt \
-  --mode layerwise --lw-seq 32768 --lw-batch 16
+  --weights fused_weights.pt \
+  --mode layerwise --lw-seq 64000 --lw-batch 16 \
+  --output-dir results/
 ```
+
+Reports per-layer attention latency for BF16 SDPA, low-rank without Triton, and the Triton kernel at both the padded uniform rank and the real per-head rank, using the ranks read from the checkpoint. Results are written to `results/layerwise_latency.csv` — rename it between runs, since each run overwrites the same file.
 
 ### Triton Kernel Benchmarks
 
 ```
-# Test correctness of the fused ABX+RoPE kernel
+# Test correctness of the fused ABX+RoPE kernel, including per-head dynamic rank
 python abx_rope_batched.py --check
 
 # Benchmark ABX+RoPE across sequence lengths

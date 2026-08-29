@@ -1,4 +1,4 @@
-"""Evaluate a trained low-rank KV cache model.
+"""Evaluate a fused low-rank KV cache model (the checkpoint train.py --output writes).
 
 Supports:
   - Perplexity on WikiText-2, C4, PTB
@@ -6,25 +6,39 @@ Supports:
   - Long-context: LongBench tasks
   - Long-context: RULER tasks
 
+Pass --triton to evaluate through the fused Triton attention (the path
+latency.py benchmarks) rather than the pure-PyTorch reference.
+
 Example
 -------
   # Zero-shot accuracy on standard tasks
   python eval.py \\
-    --model lmsys/longchat-7b-v1.5-32k \\
-    --weights trained_weights.pt \\
+    --model meta-llama/Llama-3.2-3B \\
+    --weights fused_weights.pt \\
     --tasks piqa,winogrande,arc_easy,arc_challenge,openbookqa,hellaswag \\
     --batch-size 32
 
   # Perplexity
   python eval.py \\
-    --model lmsys/longchat-7b-v1.5-32k \\
-    --weights trained_weights.pt \\
+    --model meta-llama/Llama-3.2-3B \\
+    --weights fused_weights.pt \\
     --ppl --ppl-datasets wikitext2,c4
+
+  # Baseline perplexity (uncompressed model, no weights needed)
+  python eval.py \\
+    --model meta-llama/Llama-3.2-3B \\
+    --baseline --ppl --ppl-datasets wikitext2,c4
+
+  # Through the deployed Triton attention path
+  python eval.py \\
+    --model meta-llama/Llama-3.2-3B \\
+    --weights fused_weights.pt --triton \\
+    --ppl --ppl-datasets wikitext2
 
   # Long-context benchmarks
   python eval.py \\
-    --model lmsys/longchat-7b-v1.5-32k \\
-    --weights trained_weights.pt \\
+    --model meta-llama/Llama-3.2-3B \\
+    --weights fused_weights.pt \\
     --longbench --ruler
 """
 
@@ -45,6 +59,21 @@ from model import (
     replace_attn_with_triton,
     set_model_mode,
 )
+
+
+def _assert_decomposition_loaded(missing):
+    """Fail loudly if the checkpoint omitted any U/Sigma/V tensor.
+
+    replace_linear_layer(init_svd=False) leaves the factors zeroed, so a key
+    that silently fails to load would produce a dead layer rather than a
+    merely inaccurate one. strict=False is needed for unrelated buffers.
+    """
+    critical = [k for k in missing if any(t in k for t in (".U.", ".V.", "Sigma"))]
+    if critical:
+        raise RuntimeError(
+            f"{len(critical)} decomposition tensors missing from the checkpoint; "
+            f"they would stay zero. First few: {critical[:5]}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -144,8 +173,13 @@ def parse_args():
     p = argparse.ArgumentParser(description="Evaluate a low-rank KV cache model.")
     p.add_argument("--model", required=True,
                    help="HuggingFace model name or local path")
-    p.add_argument("--weights", required=True,
-                   help="Path to trained weights (.pt file from train.py)")
+    p.add_argument("--weights", default=None,
+                   help="Path to trained weights (not needed for --baseline)")
+    p.add_argument("--baseline", action="store_true",
+                   help="Evaluate the uncompressed model (no weights needed)")
+    p.add_argument("--triton", action="store_true",
+                   help="Evaluate through the fused Triton attention path (what "
+                        "latency.py benchmarks) instead of the pure-PyTorch reference")
     p.add_argument("--skip-layers", type=int, nargs="+", default=[0, 1, 31],
                    help="Attention layers left uncompressed during training")
 
@@ -183,6 +217,8 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if not args.baseline and args.weights is None:
+        raise ValueError("--weights is required unless --baseline is set")
     os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda_devices
 
     hf_token = os.environ.get("HF_TOKEN", "")
@@ -207,26 +243,37 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
 
     # ── Inject decomposed structure, load weights ────────────────────────────
-    print("Injecting low-rank decompositions...")
-    model = model.float()
-    # replace_linear_layer modifies the model in place and returns None,
-    # so call it as a statement (do not reassign `model`).
-    replace_linear_layer(model, config, skip_layers=tuple(args.skip_layers))
+    if args.baseline:
+        model = model.bfloat16()
+    else:
+        print("Injecting low-rank decompositions...")
+        model = model.float()
+        # replace_linear_layer modifies the model in place and returns None,
+        # so call it as a statement (do not reassign `model`).
+        # init_svd=False: the checkpoint below overwrites every factor, so the
+        # SVD would be ~15 min of discarded work.
+        replace_linear_layer(model, config, skip_layers=tuple(args.skip_layers),
+                             init_svd=False)
 
-    print(f"Loading weights: {args.weights}")
-    model.load_state_dict(
-        torch.load(args.weights, map_location="cpu", weights_only=False),
-        strict=False,
-    )
-    model = model.bfloat16()
+        print(f"Loading weights: {args.weights}")
+        missing, _ = model.load_state_dict(
+            torch.load(args.weights, map_location="cpu", weights_only=False),
+            strict=False,
+        )
+        _assert_decomposition_loaded(missing)
+        model = model.bfloat16()
 
-    # Export inference-ready weights (fold Sigma, prune dead ranks) and replace
-    # attention modules with the unified prefill+decode forward.
-    # print("Exporting inference weights and replacing attention modules...")
-    # model = replace_attn_with_triton(
-    #     model, config, skip_layers=tuple(args.skip_layers), dtype=torch.bfloat16
-    # )
-    # set_model_mode(model, "triton", skip_layers=tuple(args.skip_layers))
+    # Optionally export inference-ready weights (fold Sigma, prune dead ranks) and
+    # swap in the fused Triton attention -- the same path latency.py benchmarks.
+    # Off by default: the pure-PyTorch DecomposeLinear path is the accuracy
+    # reference. Note perplexity runs prefill only (use_cache=False), so it does
+    # not exercise the decode kernel; --triton matters for generation tasks.
+    if args.triton and not args.baseline:
+        print("Exporting inference weights and replacing attention modules...")
+        model = replace_attn_with_triton(
+            model, config, skip_layers=tuple(args.skip_layers), dtype=torch.bfloat16
+        )
+        set_model_mode(model, "triton", skip_layers=tuple(args.skip_layers))
     model.eval()
     model.config.use_cache = True
 
