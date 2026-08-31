@@ -41,18 +41,24 @@ def main():
             continue
 
         pre = f"model.layers.{li}.self_attn."
-        keeps, h = [], 0
-        while f"{pre}k_proj.Sigma_blocks.{h}.diag" in sd:
-            diag = sd[f"{pre}k_proj.Sigma_blocks.{h}.diag"].float()
-            alpha = float(sd[f"{pre}k_proj.Sigma_blocks.{h}.soft_thres_layer.alpha"])
-            keeps.append(int((diag > alpha).sum()))
-            h += 1
-        if not keeps:
-            raise RuntimeError(f"layer {li}: no k_proj Sigma_blocks found in checkpoint")
 
-        d = sd[f"{pre}v_proj.Sigma.diag"].float()
-        a = float(sd[f"{pre}v_proj.Sigma.soft_thres_layer.alpha"])
-        v_rank = int((d > a).sum())
+        if f"{pre}k_proj.head_ranks" in sd:
+            # Fused format: ranks are the tensor shapes, nothing to threshold.
+            keeps = [int(r) for r in sd[f"{pre}k_proj.head_ranks"].tolist()]
+            v_rank = int(sd[f"{pre}v_proj.VS.weight"].shape[0])
+        else:
+            keeps, h = [], 0
+            while f"{pre}k_proj.Sigma_blocks.{h}.diag" in sd:
+                diag = sd[f"{pre}k_proj.Sigma_blocks.{h}.diag"].float()
+                alpha = float(sd[f"{pre}k_proj.Sigma_blocks.{h}.soft_thres_layer.alpha"])
+                keeps.append(int((diag > alpha).sum()))
+                h += 1
+            if not keeps:
+                raise RuntimeError(f"layer {li}: no k_proj ranks found in checkpoint")
+
+            d = sd[f"{pre}v_proj.Sigma.diag"].float()
+            a = float(sd[f"{pre}v_proj.Sigma.soft_thres_layer.alpha"])
+            v_rank = int((d > a).sum())
 
         # Export pads every head up to the layer's max kept rank.
         K += args.num_kv_heads * max(keeps)

@@ -234,6 +234,326 @@ class DecomposeLinear(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Fused (post-training) projections: only U and VS survive
+# ---------------------------------------------------------------------------
+
+class FusedDecomposeLinear(nn.Module):
+    """Joint low-rank projection after fusion: W ~= U @ VS.
+
+    Sigma is gone -- its surviving entries are multiplied into VS and its dead
+    directions are physically removed, so `rank` is the real kept rank rather
+    than the full-rank width with zeroed rows. Nothing here has a soft
+    threshold, a mask, or anything else that only made sense during training.
+    """
+
+    def __init__(self, in_features: int, out_features: int, rank: int,
+                 device=None, dtype=None):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.rank = rank
+        self.VS = nn.Linear(in_features, rank, bias=False, device=device, dtype=dtype)
+        self.U = nn.Linear(rank, out_features, bias=False, device=device, dtype=dtype)
+        self.bias = None
+
+    def forward(self, x):
+        return self.U(self.VS(x))
+
+
+class FusedDecomposeLinear_headwise(nn.Module):
+    """Per-head low-rank K projection after fusion: W ~= U @ VS, U block-diagonal.
+
+    Heads keep different numbers of directions, so VS is their concatenation and
+    `head_ranks` records the split. It is a persistent buffer rather than a
+    Python attribute precisely so the block structure survives in the checkpoint
+    -- without it, a pruned U/VS pair is just two matrices with no way to
+    recover which rows belong to which head, and the Triton export could not
+    slice them.
+    """
+
+    def __init__(self, in_features: int, out_features: int, head_ranks,
+                 head_dim: int, device=None, dtype=None):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self._head_dim = head_dim
+        ranks = [int(r) for r in head_ranks]
+        self.rank = int(sum(ranks))
+        self.VS = nn.Linear(in_features, self.rank, bias=False, device=device, dtype=dtype)
+        self.U = nn.Linear(self.rank, out_features, bias=False, device=device, dtype=dtype)
+        self.register_buffer(
+            "head_ranks", torch.tensor(ranks, dtype=torch.int32, device=device)
+        )
+        self.bias = None
+
+        # Hold U block-diagonal under any later fine-tune (e.g. phase 3). Fusion
+        # emits it with off-block entries at zero, but U is a plain nn.Linear
+        # now, so a single optimizer step would train them into cross-head
+        # mixing -- which export_kproj_for_triton slices away, silently
+        # reopening the gap between the trained and the deployed model.
+        # Masking the gradient enforces this at zero inference cost, and the
+        # mask is non-persistent so the checkpoint still holds only U, VS and
+        # head_ranks (it is rebuilt from head_ranks on construction anyway).
+        block_mask = torch.zeros(out_features, self.rank, device=device, dtype=dtype)
+        row = col = 0
+        for r in ranks:
+            block_mask[row:row + head_dim, col:col + r] = 1.0
+            row += head_dim
+            col += r
+        self.register_buffer("block_mask", block_mask, persistent=False)
+        self.U.weight.register_hook(lambda g: g * self.block_mask)
+
+    @property
+    def _r_list(self):
+        return [int(r) for r in self.head_ranks.tolist()]
+
+    def forward(self, x):
+        return self.U(self.VS(x))
+
+
+@torch.no_grad()
+def _fuse_joint(dec: DecomposeLinear) -> FusedDecomposeLinear:
+    """DecomposeLinear -> FusedDecomposeLinear, dead directions removed."""
+    device = dec.U.weight.device
+    dtype = dec.U.weight.dtype
+    diag = dec.Sigma.diag.detach().float()
+    s_eff = dec.Sigma.soft_thres_layer(diag)
+    keep = (s_eff > 0).nonzero(as_tuple=False).view(-1)
+    if keep.numel() == 0:                      # never emit a rank-0 layer
+        keep = torch.zeros(1, dtype=torch.long, device=device)
+
+    # MaskedLinear's forward is linear(x, weight * mask), so the mask is part of
+    # the effective weight and must be applied before pruning.
+    V_eff = (dec.V.weight * dec.V.mask).detach().float()
+    U_eff = (dec.U.weight * dec.U.mask).detach().float()
+
+    out = FusedDecomposeLinear(dec.in_features, dec.out_features, keep.numel(),
+                               device=device, dtype=dtype)
+    out.VS.weight.data.copy_((V_eff[keep] * s_eff[keep, None]).to(dtype))
+    out.U.weight.data.copy_(U_eff[:, keep].to(dtype))
+    return out
+
+
+@torch.no_grad()
+def _fuse_headwise(dec: DecomposeLinear_headwise) -> FusedDecomposeLinear_headwise:
+    """DecomposeLinear_headwise -> FusedDecomposeLinear_headwise, per head."""
+    device = dec.U.weight.device
+    dtype = dec.U.weight.dtype
+    Hd = dec._head_dim
+    V_eff = (dec.V.weight * dec.V.mask).detach().float()
+    U_eff = (dec.U.weight * dec.U.mask).detach().float()
+
+    VS_blocks, U_blocks, ranks = [], [], []
+    col = 0
+    for h, sb in enumerate(dec.Sigma_blocks):
+        r_h = sb.diag.numel()
+        s_eff = sb.soft_thres_layer(sb.diag.detach().float())
+        keep = (s_eff > 0).nonzero(as_tuple=False).view(-1)
+        if keep.numel() == 0:
+            keep = torch.zeros(1, dtype=torch.long, device=device)
+        cols = col + keep
+        VS_blocks.append(V_eff[cols] * s_eff[keep, None])
+        U_blocks.append(U_eff[h * Hd:(h + 1) * Hd][:, cols])
+        ranks.append(int(keep.numel()))
+        col += r_h
+
+    out = FusedDecomposeLinear_headwise(dec.in_features, dec.out_features, ranks,
+                                        Hd, device=device, dtype=dtype)
+    out.VS.weight.data.copy_(torch.cat(VS_blocks, dim=0).to(dtype))
+    # Reassemble U block-diagonally at the pruned widths.
+    U_new = U_eff.new_zeros(dec.out_features, sum(ranks))
+    off = 0
+    for h, (blk, r) in enumerate(zip(U_blocks, ranks)):
+        U_new[h * Hd:(h + 1) * Hd, off:off + r] = blk
+        off += r
+    out.U.weight.data.copy_(U_new.to(dtype))
+    return out
+
+
+@torch.no_grad()
+def enforce_rank_floor(model, min_rank: int, skip_layers: tuple = (0, 1, 31)):
+    """Clamp every soft-threshold so at least `min_rank` directions survive it.
+
+    Nothing stops alpha from climbing past a head's entire spectrum, and heads
+    that collapse to rank 1-4 stop carrying signal while still occupying a slot.
+    The floor has to be applied during training, not at fusion: a direction
+    pruned by the threshold has s_eff = 0, so its VS row is zero, and
+    "restoring" it afterwards would just re-insert a zero row the model was
+    never trained to use.
+
+    Since `keep` is `diag > alpha`, guaranteeing k survivors means holding alpha
+    below the k-th largest singular value. The margin is relative because diag
+    is bf16 during training, where subtracting a tiny absolute epsilon rounds
+    straight back to the original value.
+
+    The floor is usually free in cache terms: the K cache pads every head up to
+    its layer's max rank, so raising a short head costs nothing unless the floor
+    exceeds that max.
+    """
+    if min_rank <= 0:
+        return
+    skip = set(skip_layers)
+    for i, block in enumerate(model.model.layers):
+        if i in skip:
+            continue
+        attn = block.self_attn
+
+        sigmas = []
+        kp = attn.k_proj
+        if isinstance(kp, DecomposeLinear_headwise):
+            sigmas.extend(kp.Sigma_blocks if hasattr(kp, "Sigma_blocks") else [kp.Sigma])
+        vp = attn.v_proj
+        if isinstance(vp, DecomposeLinear):
+            sigmas.append(vp.Sigma)
+
+        for sig in sigmas:
+            diag = sig.diag.detach().float()
+            k = min(min_rank, diag.numel())
+            kth = float(torch.topk(diag, k).values[-1])
+            margin = max(abs(kth) * 1e-2, 1e-4)
+            sig.soft_thres_layer.alpha.data.clamp_(max=kth - margin)
+
+
+@torch.no_grad()
+def fuse_and_prune(model, skip_layers: tuple = (0, 1, 31)):
+    """Swap every training-time decomposition for a pruned U/VS pair, in place.
+
+    This is the real fusion: afterwards the model holds two low-rank factors and
+    nothing else -- no Sigma, no soft-threshold, no mask, and no zeroed rows for
+    directions the threshold killed. The rank is carried by the tensor shapes
+    (plus head_ranks for the head-wise split), so a fused checkpoint no longer
+    depends on `diag > alpha` to know what survived.
+    """
+    skip = set(skip_layers)
+    for i, block in enumerate(model.model.layers):
+        if i in skip:
+            continue
+        attn = block.self_attn
+        if isinstance(attn.v_proj, DecomposeLinear):
+            attn.v_proj = _fuse_joint(attn.v_proj)
+        if isinstance(attn.k_proj, DecomposeLinear_headwise):
+            attn.k_proj = _fuse_headwise(attn.k_proj)
+    return model
+
+
+@torch.no_grad()
+def build_fused_from_state_dict(model, config, state_dict,
+                                skip_layers: tuple = (0, 1, 31)):
+    """Install fused modules shaped from a fused checkpoint's own tensors.
+
+    Pruned factors have per-layer (and per-head) widths, so the modules cannot
+    be built from the base model's Linear layers the way replace_linear_layer
+    does -- the shapes have to come from the checkpoint before load_state_dict
+    runs. VS/U tensor shapes plus head_ranks carry everything needed.
+    """
+    head_dim = getattr(config, "head_dim", None) or (
+        config.hidden_size // config.num_attention_heads
+    )
+    skip = set(skip_layers)
+    for i, block in enumerate(model.model.layers):
+        if i in skip:
+            continue
+        attn = block.self_attn
+        pre = f"model.layers.{i}.self_attn."
+
+        k_vs = state_dict.get(pre + "k_proj.VS.weight")
+        if k_vs is not None:
+            ranks = state_dict[pre + "k_proj.head_ranks"].tolist()
+            out_f = state_dict[pre + "k_proj.U.weight"].shape[0]
+            ref = attn.k_proj.weight
+            attn.k_proj = FusedDecomposeLinear_headwise(
+                k_vs.shape[1], out_f, ranks, head_dim,
+                device=ref.device, dtype=ref.dtype,
+            )
+
+        v_vs = state_dict.get(pre + "v_proj.VS.weight")
+        if v_vs is not None:
+            out_f = state_dict[pre + "v_proj.U.weight"].shape[0]
+            ref = attn.v_proj.weight
+            attn.v_proj = FusedDecomposeLinear(
+                v_vs.shape[1], out_f, v_vs.shape[0],
+                device=ref.device, dtype=ref.dtype,
+            )
+    return model
+
+
+def is_fused_state_dict(state_dict) -> bool:
+    """True if the checkpoint holds pruned U/VS factors rather than U/Sigma/V."""
+    return any(k.endswith("k_proj.VS.weight") or k.endswith("v_proj.VS.weight")
+               for k in state_dict)
+
+
+def infer_skip_layers(state_dict, num_layers: int) -> tuple:
+    """Which attention layers a checkpoint left uncompressed.
+
+    The checkpoint is the authority here: a layer is compressed iff it carries
+    decomposition tensors. Deriving this beats trusting a --skip-layers flag
+    that has to be repeated identically at train, eval and benchmark time --
+    getting it wrong leaves a plain nn.Linear where the export expects factors,
+    which used to surface as an AttributeError deep inside the export.
+    """
+    compressed = set()
+    for key in state_dict:
+        marker = None
+        for tag in (".self_attn.k_proj.", ".self_attn.v_proj."):
+            if tag in key:
+                marker = key.split(tag)[1]
+                break
+        if marker is None or marker == "weight":     # plain Linear -> untouched
+            continue
+        try:
+            compressed.add(int(key.split(".layers.")[1].split(".")[0]))
+        except (IndexError, ValueError):
+            continue
+    return tuple(sorted(set(range(num_layers)) - compressed))
+
+
+def load_compressed_checkpoint(model, config, weights_path,
+                               skip_layers: tuple = (0, 1, 31),
+                               init_svd: bool = False):
+    """Load either checkpoint format, installing whichever modules it needs.
+
+    Fused checkpoints (the format train.py now writes) get pruned U/VS modules
+    sized from the file; legacy U/Sigma/V checkpoints fall back to
+    replace_linear_layer. Raises if any decomposition tensor fails to load,
+    since with init_svd=False an unloaded factor stays zero and would silently
+    produce a dead layer rather than a merely inaccurate one.
+
+    Returns (model, fused, skip_layers) -- skip_layers as read off the
+    checkpoint, which callers must use for replace_attn_with_triton and
+    set_model_mode so every stage agrees on which layers are compressed.
+    """
+    state_dict = torch.load(weights_path, map_location="cpu", weights_only=False)
+    fused = is_fused_state_dict(state_dict)
+
+    # Trust the checkpoint over the flag: it records exactly which layers were
+    # compressed, and a stale --skip-layers otherwise leaves an uncompressed
+    # layer for the export to choke on.
+    actual_skip = infer_skip_layers(state_dict, len(model.model.layers))
+    if set(actual_skip) != set(skip_layers):
+        print(f"  note: checkpoint leaves layers {actual_skip} uncompressed, "
+              f"but --skip-layers said {tuple(sorted(skip_layers))}; "
+              f"using the checkpoint's.")
+    skip_layers = actual_skip
+
+    if fused:
+        build_fused_from_state_dict(model, config, state_dict, skip_layers)
+    else:
+        replace_linear_layer(model, config, skip_layers=skip_layers,
+                             init_svd=init_svd)
+
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    critical = [k for k in missing
+                if any(t in k for t in (".U.", ".V.", ".VS.", "Sigma"))]
+    if critical:
+        raise RuntimeError(
+            f"{len(critical)} decomposition tensors missing from {weights_path}; "
+            f"they would stay zero. First few: {critical[:5]}"
+        )
+    return model, fused, skip_layers
+
+
+# ---------------------------------------------------------------------------
 # Model surgery
 # ---------------------------------------------------------------------------
 
@@ -363,6 +683,20 @@ def export_kproj_for_triton(
     H = len(decomp._r_list)
     Hd = decomp._head_dim
 
+    if isinstance(decomp, FusedDecomposeLinear_headwise):
+        # Already fused and pruned: VS holds each head's surviving rows back to
+        # back, U is block-diagonal at those widths. Nothing to threshold.
+        VS_w = decomp.VS.weight.detach().float()
+        U_w = decomp.U.weight.detach().float()
+        VS_list, U_list = [], []
+        col = 0
+        for h, r_h in enumerate(decomp._r_list):
+            VS_list.append(VS_w[col:col + r_h])
+            U_list.append(U_w[h * Hd:(h + 1) * Hd, col:col + r_h])
+            col += r_h
+        return _pad_and_pack_kproj(VS_list, U_list, decomp.in_features, H, Hd,
+                                   device, dtype)
+
     U_w = decomp.U.weight.detach().float()
     V_w = decomp.V.weight.detach().float()
 
@@ -382,6 +716,16 @@ def export_kproj_for_triton(
         U_list.append(U_w[h * Hd:(h + 1) * Hd][:, cols])
         col_off += r_h
 
+    return _pad_and_pack_kproj(VS_list, U_list, decomp.in_features, H, Hd,
+                               device, dtype)
+
+
+def _pad_and_pack_kproj(VS_list, U_list, in_features, H, Hd, device, dtype):
+    """Pad per-head factors to the layer's max rank and pack them for the kernel.
+
+    Shared by both export paths (fused and legacy) so the padding, the rank
+    vector and the dense reconstruction can only ever be built one way.
+    """
     # Real rank per head, captured before padding — this is what lets the decode
     # kernel skip the zero padding instead of computing through it.
     ranks = torch.tensor([v.shape[0] for v in VS_list], dtype=torch.int32, device=device)
@@ -392,7 +736,7 @@ def export_kproj_for_triton(
     VS_cat = torch.cat(VS_list, dim=0).to(dtype)
     U_ten = torch.stack(U_list, dim=0).to(dtype)
 
-    VS_lin = nn.Linear(decomp.in_features, H * max_r, bias=False).to(device=device, dtype=dtype)
+    VS_lin = nn.Linear(in_features, H * max_r, bias=False).to(device=device, dtype=dtype)
     VS_lin.weight = nn.Parameter(VS_cat.to(device))
 
     # dense_weight[h] = U_ten[h] @ VS_cat[h] reconstructs the original [head_dim, in] block
@@ -419,19 +763,25 @@ def export_vproj_for_triton(
     dense_weight: Tensor     [out_features, in_features]
     """
     device = decomp.U.weight.device
-    U_w = decomp.U.weight.detach().float()
-    V_w = decomp.V.weight.detach().float()
 
-    sig = decomp.Sigma
-    diag = sig.diag.detach().float()
-    alpha = float(sig.soft_thres_layer.alpha)
-    keep = (diag > alpha).nonzero(as_tuple=False).view(-1)
-    if keep.numel() == 0:
-        keep = torch.zeros(1, dtype=torch.long, device=device)
-    s_vals = sig.soft_thres_layer(diag[keep])
+    if isinstance(decomp, FusedDecomposeLinear):
+        # Already fused and pruned: VS/U are the exported factors verbatim.
+        VS = decomp.VS.weight.detach().to(dtype)
+        U_pruned = decomp.U.weight.detach().to(dtype)
+    else:
+        U_w = decomp.U.weight.detach().float()
+        V_w = decomp.V.weight.detach().float()
 
-    VS = (V_w[keep] * s_vals[:, None]).to(dtype)
-    U_pruned = U_w[:, keep].to(dtype)
+        sig = decomp.Sigma
+        diag = sig.diag.detach().float()
+        alpha = float(sig.soft_thres_layer.alpha)
+        keep = (diag > alpha).nonzero(as_tuple=False).view(-1)
+        if keep.numel() == 0:
+            keep = torch.zeros(1, dtype=torch.long, device=device)
+        s_vals = sig.soft_thres_layer(diag[keep])
+
+        VS = (V_w[keep] * s_vals[:, None]).to(dtype)
+        U_pruned = U_w[:, keep].to(dtype)
 
     rk = VS.shape[0]
     VS_lin = nn.Linear(decomp.in_features, rk, bias=False).to(device=device, dtype=dtype)
@@ -460,13 +810,22 @@ class KProjInferenceWrapper(nn.Module):
 
 
 class VProjInferenceWrapper(nn.Module):
-    """Wraps exported v_proj so LlamaCustomAttention can access .VS, .U, .dense_weight."""
+    """Wraps exported v_proj so LlamaCustomAttention can access .VS, .U, .dense_weight.
 
-    def __init__(self, VS_linear: nn.Linear, U_linear: nn.Linear, dense_weight: torch.Tensor):
+    `U_by_query_head` is U reshaped to [num_query_heads, rank_v, head_dim]: the
+    per-KV-head basis already broadcast across its GQA group and transposed into
+    the layout the decode matmul consumes. It is pure weight data, identical on
+    every step, so building it here once replaces a repeat_interleave +
+    transpose that otherwise ran per token per layer.
+    """
+
+    def __init__(self, VS_linear: nn.Linear, U_linear: nn.Linear,
+                 dense_weight: torch.Tensor, U_by_query_head: torch.Tensor):
         super().__init__()
         self.VS = VS_linear
         self.U = U_linear
         self.register_buffer("dense_weight", dense_weight)
+        self.register_buffer("U_by_query_head", U_by_query_head)
 
 
 # ---------------------------------------------------------------------------
@@ -494,7 +853,6 @@ def _patched_attn_forward(
 
     k_u = self.k_proj.U
     k_vs = self.k_proj.VS
-    v_u = self.v_proj.U
     v_vs = self.v_proj.VS
 
     k_inter = (
@@ -596,16 +954,12 @@ def _patched_attn_forward(
         )
 
         # Aggregate compact V then expand with U (avoids full V materialisation).
-        # attn_weights spans all query heads (Hq); value_states is the shared global
-        # compact V. prob_v is per query head, but the U expansion block is per KV
-        # head, so repeat each KV head's U across its query-head group (GQA).
-        # For MHA (num_key_value_groups == 1) the repeat is a no-op.
-        rank_v = value_states.shape[-1]
-        Hq = query_states.shape[1]
-        prob_v = attn_weights.squeeze(2) @ value_states          # [B, Hq, rank_v]
-        v_u_head = v_u.weight.view(H, Hd, rank_v)                 # [H_kv, Hd, rank_v]
-        v_u_head = v_u_head.repeat_interleave(self.num_key_value_groups, dim=0)  # [Hq, Hd, rank_v]
-        attn_output = prob_v.unsqueeze(-2) @ v_u_head.transpose(-1, -2)  # [B, Hq, 1, Hd]
+        # attn_weights spans all query heads; value_states is the shared global
+        # compact V, so this is one GEMM with the heads stacked rather than one
+        # GEMV per head. The U basis, already broadcast across each GQA group,
+        # is precomputed at export time (see VProjInferenceWrapper).
+        prob_v = attn_weights.squeeze(2) @ value_states                  # [B, Hq, rank_v]
+        attn_output = prob_v.unsqueeze(-2) @ self.v_proj.U_by_query_head  # [B, Hq, 1, Hd]
 
     attn_output = attn_output.transpose(1, 2).contiguous()
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()
@@ -704,7 +1058,18 @@ def replace_attn_with_triton(
         new_attn.k_proj = KProjInferenceWrapper(k_VS, k_U, k_dense, k_ranks)
 
         v_VS, v_U, v_dense = export_vproj_for_triton(orig.v_proj, dtype=dtype)
-        new_attn.v_proj = VProjInferenceWrapper(v_VS, v_U, v_dense)
+        # Broadcast the per-KV-head V basis across its GQA group and transpose
+        # into the decode matmul's layout, once, instead of per token.
+        n_rep = num_heads // config.num_key_value_heads
+        rank_v = v_U.weight.shape[1]
+        v_U_by_q = (
+            v_U.weight.detach()
+            .view(config.num_key_value_heads, config.head_dim, rank_v)
+            .repeat_interleave(n_rep, dim=0)
+            .transpose(-1, -2)
+            .contiguous()
+        )
+        new_attn.v_proj = VProjInferenceWrapper(v_VS, v_U, v_dense, v_U_by_q)
 
         new_attn.register_buffer("rope_inv_freq", rope_inv_freq.to(device), persistent=False)
         new_attn.rope_attn_scaling = rope_attn_scaling

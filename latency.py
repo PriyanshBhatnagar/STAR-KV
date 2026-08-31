@@ -47,7 +47,7 @@ from huggingface_hub import login
 from transformers import AutoTokenizer, LlamaForCausalLM
 
 from model import (
-    replace_linear_layer,
+    load_compressed_checkpoint,
     replace_attn_with_triton,
     set_model_mode,
 )
@@ -453,29 +453,22 @@ def main():
     )
     config = model.config
 
-    model = model.float()
-    # init_svd=False: the checkpoint below overwrites every factor, so the SVD
-    # would be ~15 min of discarded work.
-    replace_linear_layer(model, config, skip_layers=tuple(args.skip_layers),
-                         init_svd=False)
     print(f"Loading weights: {args.weights}")
-    missing, _ = model.load_state_dict(
-        torch.load(args.weights, map_location="cpu", weights_only=False),
-        strict=False,
+    model = model.float()
+    # Installs pruned U/VS modules for a fused checkpoint, or the legacy
+    # U/Sigma/V ones otherwise, and raises if any factor fails to load.
+    model, fused, skip_layers = load_compressed_checkpoint(
+        model, config, args.weights, skip_layers=tuple(args.skip_layers)
     )
-    # init_svd=False leaves factors zeroed, so a silently-missing key would
-    # produce a dead layer rather than a merely inaccurate one.
-    _critical = [k for k in missing if any(t in k for t in (".U.", ".V.", "Sigma"))]
-    if _critical:
-        raise RuntimeError(
-            f"{len(_critical)} decomposition tensors missing from the checkpoint; "
-            f"they would stay zero. First few: {_critical[:5]}"
-        )
+    # Keep every downstream consumer (run_e2e, run_layerwise) on the layer set
+    # the checkpoint actually compressed.
+    args.skip_layers = list(skip_layers)
+    print(f"  format: {'fused U/VS (pruned)' if fused else 'legacy U/Sigma/V'}")
     model = model.bfloat16()
 
     print("Exporting and replacing attention modules...")
     model = replace_attn_with_triton(
-        model, config, skip_layers=tuple(args.skip_layers), dtype=torch.bfloat16
+        model, config, skip_layers=skip_layers, dtype=torch.bfloat16
     )
     model.eval()
     model.config.use_cache = True

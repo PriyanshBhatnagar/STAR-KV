@@ -14,3 +14,5 @@ train_eval.ipynb
 results/
 .gitignore
 .claude
+layerwise_absorbed.py
+previous.ipynb

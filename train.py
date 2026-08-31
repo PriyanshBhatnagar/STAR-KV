@@ -30,6 +30,7 @@ Example
 
 
 import argparse
+import gc
 import os
 
 import torch
@@ -47,8 +48,8 @@ from transformers import (
 from tqdm import tqdm
 
 from model import (
-    DecomposeLinear,
-    DecomposeLinear_headwise,
+    enforce_rank_floor,
+    fuse_and_prune,
     replace_linear_layer,
     collect_K_parameter_size,
     collect_V_parameter_size,
@@ -122,97 +123,6 @@ def comp_loss_v(model):
 
 
 # ---------------------------------------------------------------------------
-# Phase-3 fusion: bake Sigma into V in-place (no Triton, no custom attention)
-# ---------------------------------------------------------------------------
-
-@torch.no_grad()
-def _fuse_sigma_into_v_inplace(model, skip_layers):
-    """Multiply soft-thresholded Sigma diagonal into V.weight for every
-    DecomposeLinear / DecomposeLinear_headwise layer, then reduce Sigma to the
-    binary keep-mask (1 for surviving ranks, 0 for pruned), alpha=0, and freeze.
-
-    Sigma must NOT be filled with all-ones here.  Fusing zeroes the pruned rows
-    of V, but the rank bookkeeping lives in Sigma: export_kproj/vproj_for_triton
-    select surviving ranks with `keep = diag > alpha`.  An all-ones diagonal
-    makes that predicate true for every rank, so export silently emits a
-    full-rank (zero-padded) cache and the KV compression is lost — invisibly,
-    since the forward stays numerically correct either way.
-
-    Writing the keep-mask instead keeps `diag > alpha` selecting exactly the
-    surviving ranks, and soft_thres_layer(1.0) with alpha=0 is tanh(50) == 1.0,
-    so S remains an exact identity on kept ranks.  It also holds the pruning
-    during any later fine-tune: gradient into a pruned V row is scaled by
-    s_i = 0, so rows zeroed here stay zeroed.
-    """
-    skip = set(skip_layers)
-    for i, block in enumerate(model.model.layers):
-        if i in skip:
-            continue
-        attn = block.self_attn
-
-        # ── v_proj: DecomposeLinear (single global Sigma) ────────────────────
-        vp = attn.v_proj
-        if isinstance(vp, DecomposeLinear):
-            diag = vp.Sigma.diag.detach().float()
-            s_eff = vp.Sigma.soft_thres_layer(diag)
-            vp.V.weight.data = (vp.V.weight.detach().float() * s_eff[:, None]).to(
-                vp.V.weight.dtype
-            )
-            vp.Sigma.diag.data.copy_((s_eff > 0).to(vp.Sigma.diag.dtype))
-            vp.Sigma.soft_thres_layer.alpha.data.fill_(0.0)
-            vp.Sigma.diag.requires_grad_(False)
-            vp.Sigma.soft_thres_layer.alpha.requires_grad_(False)
-
-        # ── k_proj: DecomposeLinear_headwise (per-head Sigma_blocks) ─────────
-        kp = attn.k_proj
-        if isinstance(kp, DecomposeLinear_headwise):
-            # Enforce the block-diagonal structure of U before fusing. New runs
-            # keep it via MaskedLinear's mask, but checkpoints trained before
-            # that mask existed carry cross-head entries which the Triton export
-            # drops -- zeroing them here keeps the saved model identical to the
-            # one that actually gets deployed.
-            if hasattr(kp, "Sigma_blocks") and getattr(kp, "_r_list", None):
-                Hd = kp._head_dim
-                keep_mask = torch.zeros_like(kp.U.weight)
-                row = col = 0
-                for r_h in kp._r_list:
-                    keep_mask[row:row + Hd, col:col + r_h] = 1.0
-                    row += Hd
-                    col += r_h
-                dropped = (kp.U.weight.detach().float() * (1 - keep_mask.float())).norm()
-                total = kp.U.weight.detach().float().norm()
-                if total > 0 and (dropped / total) > 0.05:
-                    print(f"  [fuse] layer {i}: dropping {100 * dropped / total:.2f}% of "
-                          f"U energy outside the per-head blocks")
-                kp.U.weight.data.mul_(keep_mask)
-
-            if hasattr(kp, "Sigma_blocks"):
-                col = 0
-                for sb in kp.Sigma_blocks:
-                    r_h = sb.diag.numel()
-                    diag = sb.diag.detach().float()
-                    s_eff = sb.soft_thres_layer(diag)
-                    kp.V.weight.data[col:col + r_h] = (
-                        kp.V.weight.detach()[col:col + r_h].float() * s_eff[:, None]
-                    ).to(kp.V.weight.dtype)
-                    sb.diag.data.copy_((s_eff > 0).to(sb.diag.dtype))
-                    sb.soft_thres_layer.alpha.data.fill_(0.0)
-                    sb.diag.requires_grad_(False)
-                    sb.soft_thres_layer.alpha.requires_grad_(False)
-                    col += r_h
-            else:
-                diag = kp.Sigma.diag.detach().float()
-                s_eff = kp.Sigma.soft_thres_layer(diag)
-                kp.V.weight.data = (kp.V.weight.detach().float() * s_eff[:, None]).to(
-                    kp.V.weight.dtype
-                )
-                kp.Sigma.diag.data.copy_((s_eff > 0).to(kp.Sigma.diag.dtype))
-                kp.Sigma.soft_thres_layer.alpha.data.fill_(0.0)
-                kp.Sigma.diag.requires_grad_(False)
-                kp.Sigma.soft_thres_layer.alpha.requires_grad_(False)
-
-
-# ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
 
@@ -250,9 +160,14 @@ def parse_args():
                    help="Weight for the K compression regularisation loss (phase 1 only)")
     p.add_argument("--comp-weight-v", type=float, default=0.1,
                    help="Weight for the V compression regularisation loss (phase 1 only)")
-    p.add_argument("--grad-accum", type=int, default=4,
+    p.add_argument("--min-head-rank", type=int, default=8,
+                   help="Minimum surviving rank per attention head. Stops the "
+                        "threshold from collapsing a head to rank 1-4, where it "
+                        "stops carrying signal. Usually free: the K cache pads "
+                        "every head to its layer's max rank. 0 disables.")
+    p.add_argument("--grad-accum", type=int, default=1,
                    help="Gradient accumulation steps")
-    p.add_argument("--skip-layers", type=int, nargs="+", default=[0, 1, 31],
+    p.add_argument("--skip-layers", type=int, nargs="+", default=[0, 1, 2, 31],
                    help="Attention layer indices to leave uncompressed")
     p.add_argument("--log-steps", type=int, default=100,
                    help="Print training stats and save checkpoint every N steps")
@@ -325,8 +240,9 @@ def main():
     # comp_rate is the fraction REMOVED: 0.7 = 70% compressed, only 30% of full dim remains.
     full_k_params = collect_K_parameter_size(model, equal=True)
     full_v_params = collect_V_parameter_size(model, equal=True)
-    k_comp_rate = min(args.desired_comp_rate + 0.09, 0.99)
-    v_comp_rate = max(args.desired_comp_rate - 0.11, 0.01)
+    k_off, v_off = (0.09, 0.11) if args.desired_comp_rate <= 0.60 else (0.045, 0.055)
+    k_comp_rate = min(args.desired_comp_rate + k_off, 0.99)
+    v_comp_rate = max(args.desired_comp_rate - v_off, 0.01)
     k_budget = int((1.0 - k_comp_rate) * full_k_params)
     v_budget = int((1.0 - v_comp_rate) * full_v_params)
     print(
@@ -452,6 +368,13 @@ def main():
                 optimizer.step()
                 lr_sched.step()
                 optimizer.zero_grad()
+                # Re-apply the floor after every alpha update, while alpha is
+                # still trainable (phase 2 freezes it, so the rank is settled).
+                if not phase2_entered:
+                    enforce_rank_floor(
+                        accelerator.unwrap_model(model),
+                        args.min_head_rank, args.skip_layers,
+                    )
 
                 # ── Per-projection budget check; phase 2 when both done ────
                 if not phase2_entered:
@@ -511,7 +434,7 @@ def main():
                                     if p.requires_grad
                                     and not any(nd in n for nd in no_decay)
                                 ],
-                                "weight_decay": 0.01, "lr": args.lr,
+                                "weight_decay": 0.01, "lr": 5e-6,
                             },
                             {
                                 "params": [
@@ -519,7 +442,7 @@ def main():
                                     if p.requires_grad
                                     and any(nd in n for nd in no_decay)
                                 ],
-                                "weight_decay": 0.0, "lr": args.lr,
+                                "weight_decay": 0.0, "lr": 5e-6,
                             },
                         ])
                         steps_remaining = max(1, num_steps - global_step)
@@ -572,16 +495,27 @@ def main():
     # The in-memory model sits at the LAST step, not the best one, so restore
     # the best Phase 1/2 state before fusing.
     raw_model = accelerator.unwrap_model(model)
+
+    # Free the Phase 1/2 optimizer before fusing. Its Adam moments are sized for
+    # the pre-fusion U/Sigma/V parameters, which fusion is about to replace --
+    # keeping it alive pins a full copy of exp_avg/exp_avg_sq for tensors the
+    # model no longer uses, and that is enough to OOM phase 3 on its first step.
+    del optimizer, lr_sched
+    gc.collect()
+    torch.cuda.empty_cache()
+
     if os.path.exists(staging_path):
         print(f"Restoring best Phase 1/2 state from {staging_path}...")
         raw_model.load_state_dict(
             torch.load(staging_path, map_location="cpu", weights_only=False), strict=False
         )
 
-    print("Fusing Sigma into V...")
-    _fuse_sigma_into_v_inplace(raw_model, args.skip_layers)
+    print("Fusing Sigma into V and pruning dead ranks...")
+    fuse_and_prune(raw_model, args.skip_layers)
     torch.save(raw_model.state_dict(), args.output)
     print(f"Fused checkpoint → {args.output}")
+    gc.collect()
+    torch.cuda.empty_cache()
 
     # ── Phase 3 (optional): further KD-only fine-tune of the fused model ─────
     if args.phase3_samples > 0:
@@ -590,7 +524,7 @@ def main():
         # New optimizer — as old one references now-gone U/S/V params.
         p3_optimizer = torch.optim.AdamW(
             [p for p in raw_model.parameters() if p.requires_grad],
-            lr=args.lr,
+            lr=5e-6,
             weight_decay=0.01,
         )
 

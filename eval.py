@@ -55,25 +55,10 @@ from tqdm import tqdm
 from transformers import AutoTokenizer, LlamaForCausalLM
 
 from model import (
-    replace_linear_layer,
+    load_compressed_checkpoint,
     replace_attn_with_triton,
     set_model_mode,
 )
-
-
-def _assert_decomposition_loaded(missing):
-    """Fail loudly if the checkpoint omitted any U/Sigma/V tensor.
-
-    replace_linear_layer(init_svd=False) leaves the factors zeroed, so a key
-    that silently fails to load would produce a dead layer rather than a
-    merely inaccurate one. strict=False is needed for unrelated buffers.
-    """
-    critical = [k for k in missing if any(t in k for t in (".U.", ".V.", "Sigma"))]
-    if critical:
-        raise RuntimeError(
-            f"{len(critical)} decomposition tensors missing from the checkpoint; "
-            f"they would stay zero. First few: {critical[:5]}"
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -82,7 +67,11 @@ def _assert_decomposition_loaded(missing):
 
 def _get_ppl_data(name: str, tokenizer, seqlen: int):
     if "wikitext2" in name:
-        data = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
+        data = load_dataset(
+            "Salesforce/wikitext",
+            "wikitext-2-raw-v1",
+            split="test",
+        )
         return tokenizer("\n\n".join(data["text"]), return_tensors="pt")
     if "c4" in name:
         class _Wrap:
@@ -192,7 +181,9 @@ def parse_args():
     p.add_argument("--ppl", action="store_true", help="Run perplexity evaluation")
     p.add_argument("--ppl-datasets", default="wikitext2,c4",
                    help="Comma-separated PPL datasets: wikitext2, c4, ptb")
-    p.add_argument("--ppl-seqlen", type=int, default=2048)
+    p.add_argument("--ppl-seqlen", type=int, nargs="+", default=[1024, 2048],
+                   help="Context length(s) to score perplexity at; one run per "
+                        "value (e.g. --ppl-seqlen 4096, or 1024 2048 4096)")
 
     # Long-context benchmarks
     p.add_argument("--longbench", action="store_true",
@@ -245,22 +236,19 @@ def main():
     # ── Inject decomposed structure, load weights ────────────────────────────
     if args.baseline:
         model = model.bfloat16()
+        skip_layers = tuple(args.skip_layers)
     else:
-        print("Injecting low-rank decompositions...")
-        model = model.float()
-        # replace_linear_layer modifies the model in place and returns None,
-        # so call it as a statement (do not reassign `model`).
-        # init_svd=False: the checkpoint below overwrites every factor, so the
-        # SVD would be ~15 min of discarded work.
-        replace_linear_layer(model, config, skip_layers=tuple(args.skip_layers),
-                             init_svd=False)
-
         print(f"Loading weights: {args.weights}")
-        missing, _ = model.load_state_dict(
-            torch.load(args.weights, map_location="cpu", weights_only=False),
-            strict=False,
+        model = model.float()
+        # Installs pruned U/VS modules for a fused checkpoint, or the legacy
+        # U/Sigma/V ones otherwise, and raises if any factor fails to load.
+        # skip_layers comes back as recorded in the checkpoint, so the export
+        # below cannot disagree with it about which layers are compressed.
+        model, fused, skip_layers = load_compressed_checkpoint(
+            model, config, args.weights, skip_layers=tuple(args.skip_layers)
         )
-        _assert_decomposition_loaded(missing)
+        print(f"  format: {'fused U/VS (pruned)' if fused else 'legacy U/Sigma/V'}"
+              f"   compressed layers: all except {skip_layers}")
         model = model.bfloat16()
 
     # Optionally export inference-ready weights (fold Sigma, prune dead ranks) and
@@ -271,9 +259,9 @@ def main():
     if args.triton and not args.baseline:
         print("Exporting inference weights and replacing attention modules...")
         model = replace_attn_with_triton(
-            model, config, skip_layers=tuple(args.skip_layers), dtype=torch.bfloat16
+            model, config, skip_layers=skip_layers, dtype=torch.bfloat16
         )
-        set_model_mode(model, "triton", skip_layers=tuple(args.skip_layers))
+        set_model_mode(model, "triton", skip_layers=skip_layers)
     model.eval()
     model.config.use_cache = True
 
@@ -282,7 +270,7 @@ def main():
     # ── Perplexity ───────────────────────────────────────────────────────────
     if args.ppl:
         print("\n=== Perplexity Evaluation ===")
-        for seqlen in [1024, 2048]:
+        for seqlen in args.ppl_seqlen:
             res = evaluate_ppl(
                 model, tokenizer, args.ppl_datasets, seqlen=seqlen,
                 device=get_device()
