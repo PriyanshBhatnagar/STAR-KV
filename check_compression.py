@@ -20,10 +20,10 @@ import torch
 def main():
     p = argparse.ArgumentParser(description="Report KV compression encoded in a checkpoint.")
     p.add_argument("--weights", required=True)
-    p.add_argument("--num-layers", type=int, default=28)
+    p.add_argument("--num-layers", type=int, default=32)
     p.add_argument("--num-kv-heads", type=int, default=8)
     p.add_argument("--head-dim", type=int, default=128)
-    p.add_argument("--skip-layers", type=int, nargs="+", default=[0, 1, 31])
+    p.add_argument("--skip-layers", type=int, nargs="+", default=[0, 1, 2, 31])
     p.add_argument("--per-layer", action="store_true", help="Print each layer's ranks")
     args = p.parse_args()
 

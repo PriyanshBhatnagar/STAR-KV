@@ -57,7 +57,7 @@ Low-rank projection is a promising approach for compressing the KV cache because
 1. Clone the repository
 
 ```
-git clone https://github.com/username/StarKV.git
+git clone https://github.com/PriyanshBhatnagar/STAR-KV.git
 cd StarKV
 ```
 
