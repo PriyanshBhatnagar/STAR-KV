@@ -398,6 +398,12 @@ def parse_args():
     p.add_argument("--lw-batch", type=int, default=16,
                    help="Batch size for layer-wise benchmark")
     p.add_argument("--skip-layers", type=int, nargs="+", default=[0, 1, 31])
+    p.add_argument("--lw-cpu-model", action="store_true",
+                   help="Keep the model on CPU. --mode layerwise reads only the "
+                        "per-head ranks off the model and times randomly generated "
+                        "tensors, so the weights never need GPU residency; leaving "
+                        "them on CPU frees the whole card for the benchmark and "
+                        "avoids the fp32 staging spike during checkpoint load.")
     p.add_argument("--output-dir", default="results/",
                    help="Directory for JSON results and plots")
     p.add_argument("--no-plot", action="store_true",
@@ -444,10 +450,11 @@ def main():
     if args.weights is None:
         raise ValueError("--weights is required unless --baseline is set")
 
-    print(f"Loading model: {args.model}")
+    print(f"Loading model: {args.model}"
+          + ("  (weights held on CPU)" if args.lw_cpu_model else ""))
     model = LlamaForCausalLM.from_pretrained(
         args.model,
-        device_map="auto",
+        device_map=None if args.lw_cpu_model else "auto",
         use_cache=False,
         use_safetensors=True,
     )

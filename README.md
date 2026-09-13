@@ -142,6 +142,19 @@ Add `--baseline` (and drop `--weights`) to measure the uncompressed model for co
 
 ### Latency Benchmarks
 
+#### Layer-wise Latency
+
+```
+python latency.py \
+  --model lmsys/longchat-7b-v1.5-32k \
+  --weights fused_weights.pt \
+  --mode layerwise --lw-seq 64000 --lw-batch 16 \
+  --lw-cpu-model \
+  --output-dir results/
+```
+
+Reports per-layer attention latency for BF16 SDPA, low-rank without Triton, and the Triton kernel at both the padded uniform rank and the real per-head rank, using the ranks read from the checkpoint. Results are written to `results/layerwise_latency.csv` — rename it between runs, since each run overwrites the same file.
+
 #### End-to-End Latency
 
 ```
@@ -162,33 +175,6 @@ python latency.py \
 
 If `results/baseline_latency.json` is present when running the low-rank benchmark, a speedup table is printed automatically.
 
-#### Layer-wise Latency
-
-```
-python latency.py \
-  --model lmsys/longchat-7b-v1.5-32k \
-  --weights fused_weights.pt \
-  --mode layerwise --lw-seq 64000 --lw-batch 16 \
-  --output-dir results/
-```
-
-Reports per-layer attention latency for BF16 SDPA, low-rank without Triton, and the Triton kernel at both the padded uniform rank and the real per-head rank, using the ranks read from the checkpoint. Results are written to `results/layerwise_latency.csv` — rename it between runs, since each run overwrites the same file.
-
-### Triton Kernel Benchmarks
-
-```
-# Test correctness of the fused ABX+RoPE kernel, including per-head dynamic rank
-python abx_rope_batched.py --check
-
-# Benchmark ABX+RoPE across sequence lengths
-python abx_rope_batched.py --total_rank 819 --group_size 4
-
-# Test correctness of the quantized BX kernel
-python bx_quant.py --check
-
-# Benchmark quantized BX
-python bx_quant.py --total_rank 1228
-```
 
 ## Reference
 
