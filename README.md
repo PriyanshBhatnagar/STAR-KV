@@ -29,13 +29,13 @@ Low-rank projection is a promising approach for compressing the KV cache because
 
 ## Todo Lists
 
-- [ ] Add quantization latency tests 
+- [x] Add quantization latency tests 
 - [ ] Add trained weights file for LongChat, LLaMA-3.1-8B
-- [ ] Update citation reference
+- [x] Update citation reference
 - [ ] Add links for project page, arXiv, PMLR
 - [x] Fix kernels for acc analysis
-- [x] ~~Pre-release of STAR-KV~~
-- [ ] Wire the quantized kernels (`bx_quant.py`, `*_quant.py`) into train/eval/latency
+- [x] Pre-release of STAR-KV
+- [x] Wire 4-bit KV quantization (`kv_quant.py`) into eval and latency (`--kv-quant`)
 
 ## Repository Structure
 
@@ -43,13 +43,12 @@ Low-rank projection is a promising approach for compressing the KV cache because
 ├── model.py                             # Shared: decomposed modules, attention replacement
 ├── train.py                             # Training script (soft-threshold mechanism)
 ├── eval.py                              # Evaluation: PPL, zero-shot, LongBench, RULER
-├── latency.py                           # Latency benchmarks: end-to-end and layer-wise
+├── latency.py                           # Latency benchmarks: layer-wise and end-to-end
 ├── check_compression.py                 # Report the KV compression encoded in a checkpoint
 ├── soft_thres_layer.py                  # Learnable soft-threshold function
-├── LlamaLoRaAttention_headwise.py       # Low-rank attention module w/ Triton (no quantization)
-├── LlamaLoRaAttention_headwise_quant.py # Low-rank attention module w/ Triton (int8/int4 KV cache)
+├── LlamaLoRaAttention_headwise.py       # Low-rank attention module
 ├── abx_rope_batched.py                  # Triton kernel: fused A@(B@X^T + RoPE) for K, per-head rank
-└── bx_quant.py                          # Triton kernel: fused dequant + B@X for V
+└── kv_quant.py                          # 4-bit KV quantization: format + Triton decode kernels
 ```
 
 ## Installation
@@ -58,7 +57,7 @@ Low-rank projection is a promising approach for compressing the KV cache because
 
 ```
 git clone https://github.com/PriyanshBhatnagar/STAR-KV.git
-cd StarKV
+cd STAR-KV
 ```
 
 2. Create and activate conda environment
@@ -83,21 +82,26 @@ export HF_TOKEN="your_huggingface_token"   # for gated models (e.g. Llama-3)
 export WANDB_API_KEY="your_wandb_key"      # optional
 
 python train.py \
---model meta-llama/Llama-3.1-8B-Instruct \
+--model lmsys/longchat-7b-v1.5-32k \
 --output fused_weights.pt \
 --epochs 1 --lr 2e-5 --seq-len 8192 --num-samples 4000 \
 --alpha-lr 1e-2 --alpha-samples 3000 --comp-weight-k 0.1 --comp-weight-v 0.1 --kd-weight 1.0 \
---desired-comp-rate 0.6
+--comp-ratio 0.6 --skip-layers 0 1 2 31 \
+--rank-multiple-k 16 --rank-multiple-v 32
 ```
 
-Trains with knowledge distillation from the uncompressed teacher. The soft-threshold adaptively truncates singular values for both K and V projections. After training, Sigma is fused into V and the result is written to `--output` — this fused checkpoint is the only artifact, and is used for both accuracy and latency evaluation.
+Trains with knowledge distillation from the uncompressed teacher, in two phases over `--num-samples` blocks:
 
-Optionally add `--phase3-samples N` for an extra KD-only fine-tune of the already-fused model (overwrites `--output`). Fusion is numerically exact, so this is pure additional recovery rather than a correction.
+1. **Phase 1:** a learnable soft-threshold truncates the singular values of the K and V projections until the compression budget is met (or `--alpha-samples` blocks have passed).
+2. **Phase 2:** each head's K rank is rounded up to a multiple of `--rank-multiple-k` and the V rank to a multiple of `--rank-multiple-v`, Sigma is fused into V, and the remaining blocks recover the fused model with KD alone.
 
-To confirm the checkpoint actually carries the expected compression:
+The fused model is written to `--output` — this checkpoint is the only artifact, and is used for both accuracy and latency evaluation.
+
+
+To check ranks and compression across layers:
 
 ```
-python check_compression.py --weights fused_weights.pt --per-layer
+python check_compression.py --weights fused_weights.pt --per-layer --compressed-only
 ```
 
 ### Evaluation
@@ -138,9 +142,11 @@ python eval.py \
 
 To save all results to JSON, add `--output results/eval_results.json` to any of the above commands.
 
-Add `--baseline` (and drop `--weights`) to measure the uncompressed model for comparison. Add `--triton` to evaluate through the fused Triton attention — the same path `latency.py` benchmarks — instead of the pure-PyTorch reference; note perplexity runs prefill only, so `--triton` matters for the generation-based tasks rather than PPL.
+Add `--baseline` (and drop `--weights`) to measure the uncompressed model for comparison. Add `--triton` to evaluate through the fused Triton attention — the same path `latency.py` benchmarks — instead of the pure-PyTorch reference.
 
 ### Latency Benchmarks
+
+`latency.py` times the real model: the real weights, attention modules and cache on every decode step. It loads both the uncompressed model and STAR-KV and prints the speedup directly.
 
 #### Layer-wise Latency
 
@@ -148,32 +154,57 @@ Add `--baseline` (and drop `--weights`) to measure the uncompressed model for co
 python latency.py \
   --model lmsys/longchat-7b-v1.5-32k \
   --weights fused_weights.pt \
-  --mode layerwise --lw-seq 64000 --lw-batch 16 \
-  --lw-cpu-model \
-  --output-dir results/
+  --seq 32768 --batch 16
 ```
 
-Reports per-layer attention latency for BF16 SDPA, low-rank without Triton, and the Triton kernel at both the padded uniform rank and the real per-head rank, using the ranks read from the checkpoint. Results are written to `results/layerwise_latency.csv` — rename it between runs, since each run overwrites the same file.
+Times one decode step of every compressed layer's attention module (`q_proj` through `o_proj`) for both models, and prints each layer's latency, speedup and KV bytes per token, followed by the average over the compressed layers. Only one layer is on the GPU at a time, so 32K × batch 16 fits on a 24 GB GPU; both models stay in host memory (~26 GB).
 
 #### End-to-End Latency
 
 ```
-# Step 1: baseline (no weights needed)
-python latency.py \
-  --model lmsys/longchat-7b-v1.5-32k \
-  --mode e2e --baseline \
-  --output-dir results/
-
-# Step 2: low-rank + Triton
 python latency.py \
   --model lmsys/longchat-7b-v1.5-32k \
   --weights fused_weights.pt \
-  --mode e2e \
-  --ctx-lens 256 512 1024 2048 4096 8192 16384 32000 64000 128000 \
-  --output-dir results/
+  --mode e2e --seq 4096 --batch 1
 ```
 
-If `results/baseline_latency.json` is present when running the low-rank benchmark, a speedup table is printed automatically.
+Prefills, then averages 16 decode steps (`--steps`) through the whole model, and prints the time per token, tokens per second and the speedup. The whole model is on the GPU here, so the dense cache has to fit beside the weights; a model that runs out of memory is reported as OOM. At small batch × seq a decode step is bound by reading the weights rather than the cache, so STAR-KV pulls ahead once there are more than ~3–4K cached tokens (batch × seq).
+
+### 4-bit KV Quantization
+
+An add-on to the low-rank cache (`kv_quant.py`). Every K/V latent is quantized per token: each head's leading 20% of channels (the outliers) at 4 bits and the rest at 3 bits, each group with its own scale. Before quantizing, each group is rotated by a Hadamard transform that is folded offline into the low-rank factors, so it adds no work at run time.
+
+Accuracy, with fp32 fake quantization on the PyTorch path (add `--triton` to run through the packed 4-bit cache and kernels instead):
+
+```
+python eval.py \
+  --model lmsys/longchat-7b-v1.5-32k \
+  --weights fused_weights.pt \
+  --kv-quant --tasks piqa,openbookqa
+```
+
+Latency, with the packed 4-bit cache and the Triton kernels:
+
+```
+python latency.py \
+  --model lmsys/longchat-7b-v1.5-32k \
+  --weights fused_weights.pt \
+  --seq 32768 --batch 16 --kv-quant
+```
+
+Layer-wise decode latency at batch 16 on an RTX 4090, averaged over the 28 compressed layers of longchat-7b:
+
+| Context | Dense | STAR-KV (bf16) | STAR-KV + 4-bit KV | 4-bit vs dense | 4-bit vs bf16 |
+|---|---|---|---|---|---|
+| 4K  | 3,727 µs   | 1,306 µs  | 697 µs   | 5.3x | 1.9x |
+| 8K  | 7,267 µs   | 2,340 µs  | 1,087 µs | 6.7x | 2.2x |
+| 16K | 14,390 µs  | 4,492 µs  | 1,872 µs | 7.7x | 2.4x |
+| 32K | 27,860 µs  | 8,912 µs  | 3,474 µs | 8.0x | 2.6x |
+| 64K | 54,800 µs* | 17,792 µs | 6,712 µs | 8.2x | 2.7x |
+
+\* A single dense layer does not fit at 64K × batch 16, so this point is extrapolated linearly from 16K and 32K.
+
+The 4-bit decode kernels are MHA-only (e.g. longchat-7b); on GQA models, `eval.py --kv-quant` still measures accuracy through the fake-quant path.
 
 
 ## Reference

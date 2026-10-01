@@ -98,7 +98,7 @@ def main():
     p.add_argument("--per-layer", action="store_true", help="Print each layer's ranks")
     p.add_argument("--compressed-only", action="store_true",
                    help="Report over the compressed layers only, the basis "
-                        "train.py's --desired-comp-rate uses. Default counts all "
+                        "train.py's --comp-ratio uses. Default counts all "
                         "layers, with the skipped ones at full rank -- the two "
                         "differ by a lot and must not be quoted interchangeably.")
     args = p.parse_args()

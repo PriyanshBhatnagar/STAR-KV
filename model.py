@@ -149,13 +149,11 @@ class DiagonalLinear(nn.Module):
     makes the threshold differentiable, and it is fine while alpha is still
     searching.
 
-    Phase 2 onward: the threshold has done its job and is removed. `freeze_rank`
-    picks the top-k directions outright and stores a binary keep mask; the
-    forward pass then uses `diag * keep_mask`, so
+    At phase 2 the threshold has done its job and is removed. `freeze_rank`
+    picks the top-k directions outright and stores a binary keep mask, which
+    `fuse_and_prune` then folds into VS as `diag * keep_mask`, so
 
-      * the rank is PINNED -- it can no longer drift as diag trains, which it
-        otherwise can, since a surviving value that falls back under alpha
-        silently drops a direction mid-recovery; and
+      * the rank is exactly the pinned one; and
       * kept singular values are used at FULL magnitude. Under the soft
         threshold a direction just above alpha is multiplied by
         tanh(s*(diag-alpha)) ~ 0, so rounding the rank up to a tile boundary
@@ -447,7 +445,7 @@ class FusedDecomposeLinear_headwise(nn.Module):
         )
         self.bias = None
 
-        # Hold U block-diagonal under any later fine-tune (e.g. phase 3). Fusion
+        # Hold U block-diagonal while phase 2 fine-tunes the fused model. Fusion
         # emits it with off-block entries at zero, but U is a plain nn.Linear
         # now, so a single optimizer step would train them into cross-head
         # mixing -- which export_kproj_for_triton slices away, silently
@@ -617,10 +615,9 @@ def freeze_ranks_at_multiple(model, multiple: int = 16,
         0.42, 0.30 and 0.05 of their true singular values -- full cache cost,
         a fraction of the signal. With a keep mask they are restored at 1.00.
 
-      * Stability. Phase 2 keeps training `diag`, so a surviving value that
-        drifts back under alpha silently drops a direction mid-recovery, and
-        the fused checkpoint no longer matches the rank the budget was checked
-        against. A pinned mask cannot drift.
+      * Stability. The ranks are fixed outright, so nothing during recovery
+        can drop a direction and leave the checkpoint at a different rank
+        from the one the budget was checked against.
 
     K rounds to `multiple` because the decode kernel walks the rank dimension in
     BLOCK_SIZE_R=16 tiles and masks the tail, so rounding up to a tile boundary
@@ -628,8 +625,8 @@ def freeze_ranks_at_multiple(model, multiple: int = 16,
     global factorisation consumed by a plain GEMM with no such masking, so it
     defaults to v_multiple=1: pinned, not widened.
 
-    Phase 3 then merges Sigma into V and truncates U/VS to these ranks
-    (`fuse_and_prune`), which reads the same keep masks.
+    `fuse_and_prune` then merges Sigma into V and truncates U/VS to these
+    ranks, reading the same keep masks, and phase 2 recovers that fused model.
     """
     skip = set(skip_layers)
     k_changed, v_changed = {}, {}
@@ -725,7 +722,7 @@ def shipped_K_cache_size(model) -> int:
     """K cache elements per token that the exported model actually allocates.
 
     Every head is stored at its own rank rounded up to RANK_TILE, so this is
-    sum_h(align_up(rank_h, RANK_TILE)) -- independent of --rank-multiple, which
+    sum_h(align_up(rank_h, RANK_TILE)) -- independent of --rank-multiple-k, which
     only decides what phase 2 rounds the *trained* ranks to. Quote this against
     full_K_cache_size() for the honest K compression of a checkpoint.
     """
