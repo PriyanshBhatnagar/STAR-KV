@@ -40,11 +40,16 @@ Example
     --model meta-llama/Llama-3.2-3B \\
     --weights fused_weights.pt \\
     --longbench --ruler
+
+  # With 4-bit KV quantization on top of the low-rank cache (fp32 fake quant)
+  python eval.py \\
+    --model meta-llama/Llama-3.2-3B \\
+    --weights fused_weights.pt --kv-quant \\
+    --tasks piqa,openbookqa
 """
 
 import argparse
 import json
-import math
 import os
 
 import torch
@@ -55,8 +60,10 @@ from tqdm import tqdm
 from transformers import AutoTokenizer, LlamaForCausalLM
 
 from model import (
+    fold_kv_hadamard,
     load_compressed_checkpoint,
     replace_attn_with_triton,
+    set_kv_fake_quant,
     set_model_mode,
 )
 
@@ -166,6 +173,11 @@ def parse_args():
                    help="Path to trained weights (not needed for --baseline)")
     p.add_argument("--baseline", action="store_true",
                    help="Evaluate the uncompressed model (no weights needed)")
+    p.add_argument("--kv-quant", action="store_true",
+                   help="4-bit KV quantization on top of the low-rank cache. Alone: fp32 "
+                        "fake quant on the PyTorch path, every forward (prefill too). "
+                        "With --triton: the packed cache and kernels -- exact prefill, "
+                        "quantized decode, as deployed.")
     p.add_argument("--triton", action="store_true",
                    help="Evaluate through the fused Triton attention path (what "
                         "latency.py benchmarks) instead of the pure-PyTorch reference")
@@ -197,6 +209,11 @@ def parse_args():
 
     p.add_argument("--output", default=None,
                    help="JSON file to write all results (optional)")
+    p.add_argument("--cpu-load", action="store_true",
+                   help="Load and decompress on the host, then move the bf16 model "
+                        "to the GPU. The checkpoint load runs in fp32 (~27 GB for a "
+                        "7B model), which does not fit on a 24 GB card; this keeps "
+                        "only the bf16 result resident.")
     p.add_argument("--cuda-devices", default="0",
                    help="CUDA_VISIBLE_DEVICES string")
     return p.parse_args()
@@ -210,6 +227,8 @@ def main():
     args = parse_args()
     if not args.baseline and args.weights is None:
         raise ValueError("--weights is required unless --baseline is set")
+    if args.kv_quant and args.baseline:
+        raise ValueError("--kv-quant quantizes the low-rank cache; it needs --weights, not --baseline")
     os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda_devices
 
     hf_token = os.environ.get("HF_TOKEN", "")
@@ -223,7 +242,7 @@ def main():
     print(f"Loading model: {args.model}")
     model = LlamaForCausalLM.from_pretrained(
         args.model,
-        device_map="auto",
+        device_map=None if args.cpu_load else "auto",
         use_cache=False,
         use_safetensors=True,
     )
@@ -249,7 +268,17 @@ def main():
         )
         print(f"  format: {'fused U/VS (pruned)' if fused else 'legacy U/Sigma/V'}"
               f"   compressed layers: all except {skip_layers}")
+        if args.kv_quant:
+            # In fp32, before the cast: the rotation is folded into VS and U once.
+            fold_kv_hadamard(model)
         model = model.bfloat16()
+
+    # Staged on the host: the checkpoint is loaded in fp32, which for a 7B model
+    # is ~27 GB and does not fit beside anything else on a 24 GB card. Only the
+    # bf16 result needs to be resident, so move it now -- before the export
+    # below, which places its tensors on whatever device the layer already sits.
+    if args.cpu_load:
+        model = model.to(get_device())
 
     # Optionally export inference-ready weights (fold Sigma, prune dead ranks) and
     # swap in the fused Triton attention -- the same path latency.py benchmarks.
@@ -257,11 +286,16 @@ def main():
     # reference. Note perplexity runs prefill only (use_cache=False), so it does
     # not exercise the decode kernel; --triton matters for generation tasks.
     if args.triton and not args.baseline:
-        print("Exporting inference weights and replacing attention modules...")
+        print("Exporting inference weights and replacing attention modules..."
+              + ("  (4-bit packed KV cache)" if args.kv_quant else ""))
         model = replace_attn_with_triton(
-            model, config, skip_layers=skip_layers, dtype=torch.bfloat16
+            model, config, skip_layers=skip_layers, dtype=torch.bfloat16,
+            kv_quant=args.kv_quant,
         )
         set_model_mode(model, "triton", skip_layers=skip_layers)
+    elif args.kv_quant:
+        print("4-bit KV fake quantization (fp32) on every compressed K/V latent")
+        set_kv_fake_quant(model, True)
     model.eval()
     model.config.use_cache = True
 

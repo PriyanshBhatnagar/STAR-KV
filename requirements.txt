@@ -1,14 +1,17 @@
-torch
-triton
-transformers
-datasets
-accelerate
-evaluate
-huggingface_hub
-lm_eval[longbench,ruler]
-wandb
-matplotlib
-pandas
-tqdm
-tiktoken
-sentencepiece
+# Tested with Python 3.12.7. The default PyPI torch wheel is a CUDA 13.0 build
+# (NVIDIA driver >= 580), which covers Ampere through Blackwell.
+torch==2.14.0
+triton==3.8.0
+transformers==5.16.1
+tokenizers==0.23.1
+datasets==5.0.1
+accelerate==1.14.0
+evaluate==0.4.6
+huggingface_hub==1.29.0
+lm_eval[longbench,ruler]==0.4.13
+wandb==0.29.0
+pandas==3.0.5
+tqdm==4.70.0
+tiktoken==0.14.0
+sentencepiece==0.2.2
+protobuf==7.36.1

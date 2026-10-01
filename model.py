@@ -9,6 +9,8 @@ Provides:
   - KProjInferenceWrapper / VProjInferenceWrapper: minimal wrappers for LlamaCustomAttention
   - replace_attn_with_triton: full attention-module replacement for inference
   - set_model_mode: switch between triton / no_triton / bf16_sdpa at runtime
+  - fold_kv_hadamard / set_kv_fake_quant / PackedKVLayer: the optional 4-bit KV
+    quantization add-on (format and kernels in kv_quant.py)
 """
 
 import math
@@ -19,13 +21,107 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from transformers.cache_utils import Cache
+from transformers.cache_utils import Cache, DynamicCache, DynamicLayer
 
 import LlamaLoRaAttention_headwise as attn_module
 from LlamaLoRaAttention_headwise import LlamaCustomAttention
 from LlamaLoRaAttention_headwise import apply_rotary_pos_emb_custom as _rope
 from transformers.models.llama.modeling_llama import rotate_half
 from soft_thres_layer import soft_thres_layer
+import kv_quant
+
+# Width granularity of the K cache's rank axis. The decode kernel walks that axis
+# in BLOCK_SIZE_R tiles, so every head is stored at a multiple of this: it keeps
+# each head's segment an exact number of 32-byte memory sectors (16 bf16 values),
+# which is what makes the per-head widths free to read. Must stay equal to
+# abx_rope_batched._abx_fwd's BLOCK_SIZE_R.
+RANK_TILE = 16
+
+
+class RankMajorKLayer(DynamicLayer):
+    """Cache layer for a compressed attention layer: K is stored rank-major.
+
+    K is [B, W, seq] -- the token axis LAST -- so a head's lanes stay contiguous
+    across tokens. The obvious [B, seq, W] instead puts each head's slice in a
+    different row every token, and the decode kernel then issues one scattered
+    32-byte read per token rather than long contiguous runs. Same bytes, but
+    measured 4-12% slower on this kernel, worst exactly where heads are narrow.
+
+    V is untouched: [B, seq, rank_v], token axis at -2 like any other cache.
+    Only the concatenation axis differs, which is why this is a cache LAYER
+    rather than a whole cache -- uncompressed (skipped) layers keep DynamicLayer.
+
+    Not wired for beam search: DynamicLayer's reorder/crop helpers assume the
+    token axis is at -2.
+    """
+
+    def update(self, key_states, value_states, *args, **kwargs):
+        if not self.is_initialized:
+            self.lazy_initialization(key_states, value_states)
+        self.keys = torch.cat([self.keys, key_states], dim=-1)      # tokens last
+        self.values = torch.cat([self.values, value_states], dim=-2)
+        return self.keys, self.values
+
+    def get_seq_length(self) -> int:
+        if not self.is_initialized or self.keys.numel() == 0:
+            return 0
+        return self.keys.shape[-1]
+
+
+class PackedKVLayer(DynamicLayer):
+    """Cache layer holding a compressed layer's latents packed to 4 bits.
+
+    The kv_quant add-on's format (see kv_quant.py), all token-major:
+      keys [B, L, W/2] uint8     key_scales   [B, L, H, 2] bf16
+      values [B, L, row] uint8   value_scales [B, L, 2]    bf16
+    update() takes the codes the attention computes -- K rank-major [B, W, T],
+    V [B, T, rank_v] -- quantizes and packs them, and appends. It returns them
+    unchanged: prefill runs on its exact codes, and only decode reads the cache.
+    """
+
+    def __init__(self, meta):
+        super().__init__()
+        self.meta = meta
+        self.key_scales = self.value_scales = None
+
+    def update(self, key_states, value_states, *args, **kwargs):
+        m = self.meta
+        B, W, T = key_states.shape
+        kq, ks = kv_quant.pack_k_step(key_states.transpose(1, 2).reshape(B * T, 1, W),
+                                      m.ranks, m.offsets, m.nouts, W)
+        vq, vs = kv_quant.pack_v_step(value_states.reshape(B * T, 1, -1), m.nout_v)
+        new = (kq.view(B, T, -1), ks.view(B, T, *ks.shape[2:]), vq.view(B, T, -1), vs.view(B, T, 2))
+        if not self.is_initialized:
+            self.dtype, self.device, self.is_initialized = key_states.dtype, key_states.device, True
+            self.keys, self.key_scales, self.values, self.value_scales = new
+        else:
+            old = (self.keys, self.key_scales, self.values, self.value_scales)
+            self.keys, self.key_scales, self.values, self.value_scales = (
+                kv_quant.append(o, n) for o, n in zip(old, new))
+        return key_states, value_states
+
+    def get_seq_length(self) -> int:
+        return self.keys.shape[1] if self.is_initialized else 0
+
+
+class StarKVCache(DynamicCache):
+    """DynamicCache whose compressed layers hold K rank-major.
+
+    Skipped layers run stock attention and keep a stock DynamicLayer, so the
+    two kinds of layer coexist in one cache. `replace_attn_with_triton` installs
+    this automatically whenever a caller lets the model build its own cache.
+    `packed` maps layer index -> KVQuantMeta for layers using the 4-bit cache.
+    """
+
+    def __init__(self, num_hidden_layers: int, skip_layers: tuple = (), packed=None):
+        skip = set(skip_layers)
+        packed = packed or {}
+        Cache.__init__(self, layers=[
+            DynamicLayer() if i in skip
+            else PackedKVLayer(packed[i]) if i in packed
+            else RankMajorKLayer()
+            for i in range(num_hidden_layers)
+        ])
 
 
 def _rope_tables(inv_freq, seq_len, device, dtype, attn_scaling=1.0):
@@ -46,15 +142,74 @@ def _rope_tables(inv_freq, seq_len, device, dtype, attn_scaling=1.0):
 # ---------------------------------------------------------------------------
 
 class DiagonalLinear(nn.Module):
-    """Learnable diagonal matrix gated by a soft threshold (training time)."""
+    """Learnable diagonal matrix, soft-thresholded in phase 1, hard-masked after.
+
+    Phase 1: the rank is whatever survives `diag > alpha`, and the surviving
+    singular values are scaled by tanh(s*(diag - alpha)). That scaling is what
+    makes the threshold differentiable, and it is fine while alpha is still
+    searching.
+
+    Phase 2 onward: the threshold has done its job and is removed. `freeze_rank`
+    picks the top-k directions outright and stores a binary keep mask; the
+    forward pass then uses `diag * keep_mask`, so
+
+      * the rank is PINNED -- it can no longer drift as diag trains, which it
+        otherwise can, since a surviving value that falls back under alpha
+        silently drops a direction mid-recovery; and
+      * kept singular values are used at FULL magnitude. Under the soft
+        threshold a direction just above alpha is multiplied by
+        tanh(s*(diag-alpha)) ~ 0, so rounding the rank up to a tile boundary
+        would pay full cache for directions that contribute almost nothing --
+        the newly admitted ones are by construction the ones nearest alpha.
+    """
 
     def __init__(self, feature_size: int, thres: float):
         super().__init__()
         self.diag = nn.Parameter(torch.ones(feature_size), requires_grad=True)
         self.soft_thres_layer = soft_thres_layer(50, 0.0, float(thres))
+        # Persistent so a mid-training checkpoint reloads with its rank intact.
+        self.register_buffer("keep_mask", torch.ones(feature_size))
+        self.register_buffer("rank_frozen", torch.zeros((), dtype=torch.bool))
 
     def forward(self, x):
+        if bool(self.rank_frozen):
+            return x @ torch.diag(self.diag * self.keep_mask)
         return x @ self.soft_thres_layer(torch.diag(self.diag))
+
+    @torch.no_grad()
+    def freeze_rank(self, rank: int):
+        """Pin the top-`rank` directions and retire the soft threshold.
+
+        Returns the rank actually pinned. Selection is by singular-value
+        magnitude, which is the same set the threshold was selecting -- the
+        threshold is a magnitude cutoff -- so this changes which directions
+        survive only when `rank` differs from the current one.
+        """
+        rank = max(1, min(int(rank), self.diag.numel()))
+        idx = torch.topk(self.diag.detach().float(), rank).indices
+        mask = torch.zeros_like(self.keep_mask)
+        mask[idx] = 1.0
+        self.keep_mask.copy_(mask)
+        self.rank_frozen.fill_(True)
+        return rank
+
+    def effective_diag(self) -> torch.Tensor:
+        """Singular values as the forward pass uses them, in either mode."""
+        if bool(self.rank_frozen):
+            return self.diag.detach().float() * self.keep_mask.float()
+        return self.soft_thres_layer(self.diag.detach().float())
+
+    def keep_indices(self) -> torch.Tensor:
+        """Indices of the surviving directions, in either mode."""
+        if bool(self.rank_frozen):
+            return self.keep_mask.nonzero(as_tuple=False).view(-1)
+        eff = self.soft_thres_layer(self.diag.detach().float())
+        return (eff > 0).nonzero(as_tuple=False).view(-1)
+
+    def current_rank(self) -> int:
+        if bool(self.rank_frozen):
+            return int(self.keep_mask.sum())
+        return int((self.diag > self.soft_thres_layer.alpha).sum())
 
     def set_value(self, value: torch.Tensor):
         n = value.shape[0]
@@ -256,8 +411,14 @@ class FusedDecomposeLinear(nn.Module):
         self.U = nn.Linear(rank, out_features, bias=False, device=device, dtype=dtype)
         self.bias = None
 
+    kv_quant_blocks = None   # set by fold_kv_hadamard
+    kv_fake_quant = False    # set by set_kv_fake_quant
+
     def forward(self, x):
-        return self.U(self.VS(x))
+        h = self.VS(x)
+        if self.kv_fake_quant:
+            h = kv_quant.fake_quant(h, self.kv_quant_blocks)
+        return self.U(h)
 
 
 class FusedDecomposeLinear_headwise(nn.Module):
@@ -307,8 +468,14 @@ class FusedDecomposeLinear_headwise(nn.Module):
     def _r_list(self):
         return [int(r) for r in self.head_ranks.tolist()]
 
+    kv_quant_blocks = None   # set by fold_kv_hadamard
+    kv_fake_quant = False    # set by set_kv_fake_quant
+
     def forward(self, x):
-        return self.U(self.VS(x))
+        h = self.VS(x)
+        if self.kv_fake_quant:
+            h = kv_quant.fake_quant(h, self.kv_quant_blocks)
+        return self.U(h)
 
 
 @torch.no_grad()
@@ -316,9 +483,8 @@ def _fuse_joint(dec: DecomposeLinear) -> FusedDecomposeLinear:
     """DecomposeLinear -> FusedDecomposeLinear, dead directions removed."""
     device = dec.U.weight.device
     dtype = dec.U.weight.dtype
-    diag = dec.Sigma.diag.detach().float()
-    s_eff = dec.Sigma.soft_thres_layer(diag)
-    keep = (s_eff > 0).nonzero(as_tuple=False).view(-1)
+    s_eff = dec.Sigma.effective_diag()
+    keep = dec.Sigma.keep_indices()
     if keep.numel() == 0:                      # never emit a rank-0 layer
         keep = torch.zeros(1, dtype=torch.long, device=device)
 
@@ -347,8 +513,8 @@ def _fuse_headwise(dec: DecomposeLinear_headwise) -> FusedDecomposeLinear_headwi
     col = 0
     for h, sb in enumerate(dec.Sigma_blocks):
         r_h = sb.diag.numel()
-        s_eff = sb.soft_thres_layer(sb.diag.detach().float())
-        keep = (s_eff > 0).nonzero(as_tuple=False).view(-1)
+        s_eff = sb.effective_diag()
+        keep = sb.keep_indices()
         if keep.numel() == 0:
             keep = torch.zeros(1, dtype=torch.long, device=device)
         cols = col + keep
@@ -407,11 +573,179 @@ def enforce_rank_floor(model, min_rank: int, skip_layers: tuple = (0, 1, 31)):
             sigmas.append(vp.Sigma)
 
         for sig in sigmas:
+            if bool(sig.rank_frozen):
+                continue          # rank is pinned; alpha no longer gates anything
             diag = sig.diag.detach().float()
             k = min(min_rank, diag.numel())
             kth = float(torch.topk(diag, k).values[-1])
             margin = max(abs(kth) * 1e-2, 1e-4)
             sig.soft_thres_layer.alpha.data.clamp_(max=kth - margin)
+
+
+def align_up(r: int, multiple: int) -> int:
+    """Smallest multiple of `multiple` that is >= r. multiple <= 1 is a no-op."""
+    if multiple <= 1:
+        return int(r)
+    return int(-(-int(r) // multiple) * multiple)
+
+
+@torch.no_grad()
+@torch.no_grad()
+def freeze_ranks_at_multiple(model, multiple: int = 16,
+                             skip_layers: tuple = (0, 1, 31),
+                             verbose: bool = True,
+                             v_multiple: int = 1):
+    """Phase-2 entry: pin every rank and retire the soft threshold.
+
+    Phase 1 searched for the rank with a learnable threshold alpha. Once that
+    search is over the threshold has done its job, so each projection's rank is
+    fixed outright:
+
+        r_new = align_up(r_phase1, multiple)      # K
+        r_new = align_up(r_phase1, v_multiple)    # V, default 1 = pin as-is
+
+    and `DiagonalLinear.freeze_rank` stores a binary keep mask over the top-r_new
+    singular directions. From here the forward pass is `diag * keep_mask` --
+    no tanh, no alpha.
+
+    Two things this fixes versus lowering alpha to admit more directions:
+
+      * Magnitude. Under the soft threshold a direction just above alpha is
+        scaled by tanh(s*(diag - alpha)) ~ 0, and the directions a rank increase
+        admits are BY CONSTRUCTION the ones nearest alpha. Measured on a rank
+        42 -> 48 round-up, the six new directions came back at 0.72, 0.66, 0.56,
+        0.42, 0.30 and 0.05 of their true singular values -- full cache cost,
+        a fraction of the signal. With a keep mask they are restored at 1.00.
+
+      * Stability. Phase 2 keeps training `diag`, so a surviving value that
+        drifts back under alpha silently drops a direction mid-recovery, and
+        the fused checkpoint no longer matches the rank the budget was checked
+        against. A pinned mask cannot drift.
+
+    K rounds to `multiple` because the decode kernel walks the rank dimension in
+    BLOCK_SIZE_R=16 tiles and masks the tail, so rounding up to a tile boundary
+    adds directions inside tiles that are already being issued. V is a single
+    global factorisation consumed by a plain GEMM with no such masking, so it
+    defaults to v_multiple=1: pinned, not widened.
+
+    Phase 3 then merges Sigma into V and truncates U/VS to these ranks
+    (`fuse_and_prune`), which reads the same keep masks.
+    """
+    skip = set(skip_layers)
+    k_changed, v_changed = {}, {}
+
+    for i, block in enumerate(model.model.layers):
+        if i in skip:
+            continue
+
+        kp = block.self_attn.k_proj
+        if isinstance(kp, DecomposeLinear_headwise):
+            sigmas = kp.Sigma_blocks if hasattr(kp, "Sigma_blocks") else [kp.Sigma]
+            before, after = [], []
+            for sig in sigmas:
+                r = sig.current_rank()
+                before.append(r)
+                after.append(sig.freeze_rank(align_up(r, max(multiple, 1))))
+            k_changed[i] = (before, after)
+
+        vp = block.self_attn.v_proj
+        if isinstance(vp, DecomposeLinear):
+            r = vp.Sigma.current_rank()
+            v_changed[i] = (r, vp.Sigma.freeze_rank(align_up(r, max(v_multiple, 1))))
+
+    if verbose:
+        if k_changed:
+            b = sum(sum(v[0]) for v in k_changed.values())
+            a = sum(sum(v[1]) for v in k_changed.values())
+            print(f"  [rank freeze] K pinned, rounded to multiples of {multiple}: "
+                  f"{b} -> {a} directions ({a / b - 1:+.1%}) across {len(k_changed)} layers")
+        if v_changed:
+            b = sum(v[0] for v in v_changed.values())
+            a = sum(v[1] for v in v_changed.values())
+            tag = (f"rounded to multiples of {v_multiple}" if v_multiple > 1
+                   else "pinned as-is")
+            print(f"  [rank freeze] V {tag}: {b} -> {a} directions "
+                  f"({a / b - 1:+.1%}) across {len(v_changed)} layers")
+        print("  [rank freeze] soft threshold retired; singular values now used at "
+              "full magnitude and ranks can no longer drift during recovery")
+    return {"k": k_changed, "v": v_changed}
+
+
+# ---------------------------------------------------------------------------
+# KV cache accounting (elements per token -- what actually ships)
+# ---------------------------------------------------------------------------
+# collect_K/V_parameter_size below count PROJECTION WEIGHT parameters,
+# (in+out)*rank against in*out. That is not the KV cache size: the cache holds
+# `rank` elements per token against `out_features` uncompressed, so the two
+# differ by a model-dependent factor (in+out)/in -- 2.00x for MHA
+# (longchat-7b, 4096->4096) and 1.33x for GQA (Llama-3.2-3B, 3072->1024) -- and
+# the weight metric additionally saturates at 0% until rank drops below
+# in*out/(in+out). The functions here count the cache instead.
+
+
+def _k_head_ranks(module) -> list:
+    if hasattr(module, "Sigma_blocks"):
+        return [sb.current_rank() for sb in module.Sigma_blocks]
+    return [module.Sigma.current_rank()]
+
+
+def collect_K_cache_size(model, multiple: int = 1) -> int:
+    """K cache elements per token, summed over compressed layers: sum_h(rank_h),
+    since every head is stored at its own width. Pair it with
+    multiple=RANK_TILE to get the shipped size exactly, or call
+    shipped_K_cache_size().
+
+    `multiple` applies the same rounding freeze_ranks_at_multiple does, so the
+    two stay consistent.
+    """
+    total = 0
+    for name, m in model.named_modules():
+        if not (isinstance(m, DecomposeLinear_headwise) and "k_proj" in name):
+            continue
+        ranks = [align_up(r, multiple) for r in _k_head_ranks(m)]
+        total += sum(ranks)
+    return total
+
+
+def collect_V_cache_size(model, multiple: int = 1) -> int:
+    """V cache elements per token, summed over compressed layers.
+
+    `multiple` applies the same rounding freeze_ranks_at_multiple(v_multiple=...)
+    does, so the phase-1 budget prices leveling in rather than being surprised
+    by it afterwards.
+    """
+    return sum(
+        align_up(get_rank(m), multiple)
+        for name, m in model.named_modules()
+        if isinstance(m, DecomposeLinear) and "v_proj" in name
+    )
+
+
+def shipped_K_cache_size(model) -> int:
+    """K cache elements per token that the exported model actually allocates.
+
+    Every head is stored at its own rank rounded up to RANK_TILE, so this is
+    sum_h(align_up(rank_h, RANK_TILE)) -- independent of --rank-multiple, which
+    only decides what phase 2 rounds the *trained* ranks to. Quote this against
+    full_K_cache_size() for the honest K compression of a checkpoint.
+    """
+    return collect_K_cache_size(model, RANK_TILE)
+
+
+def full_K_cache_size(model) -> int:
+    return sum(
+        m.out_features
+        for name, m in model.named_modules()
+        if isinstance(m, DecomposeLinear_headwise) and "k_proj" in name
+    )
+
+
+def full_V_cache_size(model) -> int:
+    return sum(
+        m.out_features
+        for name, m in model.named_modules()
+        if isinstance(m, DecomposeLinear) and "v_proj" in name
+    )
 
 
 @torch.no_grad()
@@ -610,13 +944,10 @@ def replace_linear_layer(model, config, skip_layers: tuple = (0, 1, 31),
 # ---------------------------------------------------------------------------
 
 def get_rank(module) -> int:
-    """Return effective rank of a decomposed module after soft-thresholding."""
+    """Effective rank: the frozen keep mask if set, else `diag > alpha`."""
     if hasattr(module, "Sigma_blocks"):
-        return sum(
-            int(torch.sum(sb.diag > sb.soft_thres_layer.alpha).item())
-            for sb in module.Sigma_blocks
-        )
-    return int(torch.sum(module.Sigma.diag > module.Sigma.soft_thres_layer.alpha).item())
+        return sum(sb.current_rank() for sb in module.Sigma_blocks)
+    return module.Sigma.current_rank()
 
 
 def _param_size(module, equal: bool) -> int:
@@ -643,15 +974,6 @@ def collect_V_parameter_size(model, equal: bool = False) -> int:
     )
 
 
-def collect_KV_parameter_size(model, equal: bool = False) -> int:
-    return sum(
-        _param_size(m, equal)
-        for name, m in model.named_modules()
-        if isinstance(m, (DecomposeLinear, DecomposeLinear_headwise))
-        and ("k_proj" in name or "v_proj" in name)
-    )
-
-
 # ---------------------------------------------------------------------------
 # Export: fold Sigma into V, prune dead ranks
 # ---------------------------------------------------------------------------
@@ -663,21 +985,22 @@ def export_kproj_for_triton(
 ) -> Tuple[nn.Linear, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fold soft-thresholded S into V per head.
 
-    Returns (VS_linear, U_tensor, dense_weight, ranks).
+    Returns (VS_linear, U_tensor, dense_weight, ranks, offsets).
 
-    Heads keep different numbers of singular directions. Storage is padded up
-    to the longest head's rank so strides stay uniform (padded rows/cols are
-    zero, so this is exact), and `ranks` carries each head's real rank so the
-    decode kernel can stop early instead of grinding through the zero padding.
+    Heads keep different numbers of singular directions, and each is stored at
+    its OWN width -- its rank rounded up to RANK_TILE -- laid out side by side
+    along one flat rank axis. `offsets` says where each head's segment starts,
+    and a layer stores sum(widths) per token.
 
     dense_weight is U @ VS reconstructed back to the original [out, in] shape,
     computed once here so prefill can do a single full-size matmul (matching
     the uncompressed baseline's cost) instead of reconstructing per token.
 
-    VS_linear   : nn.Linear  [H * max_rank, in_features]
-    U_tensor    : Tensor     [H, head_dim, max_rank]
+    VS_linear   : nn.Linear  [W, in_features]      W = sum of the per-head widths
+    U_tensor    : Tensor     [W, head_dim]         rank-major, as the kernel reads it
     dense_weight: Tensor     [H * head_dim, in_features]
     ranks       : Tensor     [H]  int32, real rank kept per head
+    offsets     : Tensor     [H]  int32, column offset of each head's segment
     """
     device = decomp.U.weight.device
     H = len(decomp._r_list)
@@ -694,8 +1017,8 @@ def export_kproj_for_triton(
             VS_list.append(VS_w[col:col + r_h])
             U_list.append(U_w[h * Hd:(h + 1) * Hd, col:col + r_h])
             col += r_h
-        return _pad_and_pack_kproj(VS_list, U_list, decomp.in_features, H, Hd,
-                                   device, dtype)
+        return _pack_kproj_ragged(VS_list, U_list, decomp.in_features, H, Hd,
+                                  device, dtype)
 
     U_w = decomp.U.weight.detach().float()
     V_w = decomp.V.weight.detach().float()
@@ -705,46 +1028,60 @@ def export_kproj_for_triton(
     for h in range(H):
         r_h = decomp._r_list[h]
         sig = decomp.Sigma_blocks[h]
-        diag = sig.diag.detach().float()
-        alpha = float(sig.soft_thres_layer.alpha)
-        keep = (diag > alpha).nonzero(as_tuple=False).view(-1)
+        keep = sig.keep_indices()
         if keep.numel() == 0:
             keep = torch.zeros(1, dtype=torch.long, device=device)
-        s_vals = sig.soft_thres_layer(diag[keep])
+        s_vals = sig.effective_diag()[keep]
         cols = col_off + keep
         VS_list.append(V_w[cols] * s_vals[:, None])
         U_list.append(U_w[h * Hd:(h + 1) * Hd][:, cols])
         col_off += r_h
 
-    return _pad_and_pack_kproj(VS_list, U_list, decomp.in_features, H, Hd,
-                               device, dtype)
+    return _pack_kproj_ragged(VS_list, U_list, decomp.in_features, H, Hd,
+                              device, dtype)
 
 
-def _pad_and_pack_kproj(VS_list, U_list, in_features, H, Hd, device, dtype):
-    """Pad per-head factors to the layer's max rank and pack them for the kernel.
+def _pack_kproj_ragged(VS_list, U_list, in_features, H, Hd, device, dtype):
+    """Pack per-head factors side by side, each at its own width.
 
-    Shared by both export paths (fused and legacy) so the padding, the rank
-    vector and the dense reconstruction can only ever be built one way.
+    Head h keeps rank_h directions and occupies width_h = align_up(rank_h,
+    RANK_TILE) columns of one flat rank axis, starting at offsets[h]. The tile
+    round-up is what the decode kernel walks in, and it keeps every segment
+    32-byte aligned; beyond rank_h the rows stay zero, so the kernel's tail mask
+    and a plain full-width read agree. A layer stores sum(widths) per token.
+
+    Shared by both export paths (fused and legacy) so the widths, the offsets,
+    the rank vector and the dense reconstruction can only ever be built one way.
     """
-    # Real rank per head, captured before padding — this is what lets the decode
-    # kernel skip the zero padding instead of computing through it.
-    ranks = torch.tensor([v.shape[0] for v in VS_list], dtype=torch.int32, device=device)
+    ranks = [int(v.shape[0]) for v in VS_list]
+    widths = [align_up(r, RANK_TILE) for r in ranks]
+    offsets = [sum(widths[:h]) for h in range(H)]
+    W = sum(widths)
 
-    max_r = max(v.shape[0] for v in VS_list)
-    VS_list = [F.pad(v, (0, 0, 0, max_r - v.shape[0])) for v in VS_list]
-    U_list = [F.pad(u, (0, max_r - u.shape[1])) for u in U_list]
-    VS_cat = torch.cat(VS_list, dim=0).to(dtype)
-    U_ten = torch.stack(U_list, dim=0).to(dtype)
+    # float32 while assembling: dense_weight below is a product of these, and
+    # rounding the factors to bf16 first would bake that error into prefill.
+    VS_cat = torch.zeros(W, in_features, device=device, dtype=torch.float32)
+    U_cat = torch.zeros(W, Hd, device=device, dtype=torch.float32)
+    dense_weight = torch.empty(H * Hd, in_features, device=device, dtype=torch.float32)
 
-    VS_lin = nn.Linear(in_features, H * max_r, bias=False).to(device=device, dtype=dtype)
-    VS_lin.weight = nn.Parameter(VS_cat.to(device))
+    for h, (off, r) in enumerate(zip(offsets, ranks)):
+        vs_h = VS_list[h].float()                 # [r, in_features]
+        u_h = U_list[h].float()                   # [head_dim, r]
+        VS_cat[off:off + r] = vs_h
+        U_cat[off:off + r] = u_h.T                # rank-major, as the kernel reads it
+        # dense_weight[h] = U_h @ VS_h reconstructs the original [head_dim, in] block
+        dense_weight[h * Hd:(h + 1) * Hd] = u_h @ vs_h
 
-    # dense_weight[h] = U_ten[h] @ VS_cat[h] reconstructs the original [head_dim, in] block
-    dense_weight = torch.einsum(
-        "hdr,hri->hdi", U_ten.float(), VS_cat.view(H, max_r, -1).float()
-    ).reshape(H * Hd, -1).to(dtype).to(device)
+    VS_lin = nn.Linear(in_features, W, bias=False).to(device=device, dtype=dtype)
+    VS_lin.weight = nn.Parameter(VS_cat.to(dtype))
 
-    return VS_lin, U_ten.to(device), dense_weight, ranks
+    return (
+        VS_lin,
+        U_cat.to(dtype),
+        dense_weight.to(dtype),
+        torch.tensor(ranks, dtype=torch.int32, device=device),
+        torch.tensor(offsets, dtype=torch.int32, device=device),
+    )
 
 
 @torch.no_grad()
@@ -773,12 +1110,10 @@ def export_vproj_for_triton(
         V_w = decomp.V.weight.detach().float()
 
         sig = decomp.Sigma
-        diag = sig.diag.detach().float()
-        alpha = float(sig.soft_thres_layer.alpha)
-        keep = (diag > alpha).nonzero(as_tuple=False).view(-1)
+        keep = sig.keep_indices()
         if keep.numel() == 0:
             keep = torch.zeros(1, dtype=torch.long, device=device)
-        s_vals = sig.soft_thres_layer(diag[keep])
+        s_vals = sig.effective_diag()[keep]
 
         VS = (V_w[keep] * s_vals[:, None]).to(dtype)
         U_pruned = U_w[:, keep].to(dtype)
@@ -798,15 +1133,25 @@ def export_vproj_for_triton(
 # ---------------------------------------------------------------------------
 
 class KProjInferenceWrapper(nn.Module):
-    """Wraps exported k_proj so LlamaCustomAttention can access .VS, .U, .dense_weight, .ranks."""
+    """Wraps exported k_proj so LlamaCustomAttention can access .VS, .U,
+    .dense_weight, .ranks and .offsets.
+
+    The K cache is ragged: head h lives at columns [offsets[h], offsets[h] +
+    width_h) of a flat rank axis, where width_h is ranks[h] rounded up to
+    RANK_TILE. `segments` is the same information as plain Python ints, so the
+    reference paths can slice per head without a device sync on every step.
+    """
 
     def __init__(self, VS_linear: nn.Linear, U_tensor: torch.Tensor,
-                 dense_weight: torch.Tensor, ranks: torch.Tensor):
+                 dense_weight: torch.Tensor, ranks: torch.Tensor,
+                 offsets: torch.Tensor):
         super().__init__()
         self.VS = VS_linear
         self.register_buffer("U", U_tensor)
         self.register_buffer("dense_weight", dense_weight)
         self.register_buffer("ranks", ranks)
+        self.register_buffer("offsets", offsets)
+        self.segments = list(zip(offsets.tolist(), ranks.tolist()))
 
 
 class VProjInferenceWrapper(nn.Module):
@@ -832,6 +1177,51 @@ class VProjInferenceWrapper(nn.Module):
 # Unified prefill+decode attention forward
 # ---------------------------------------------------------------------------
 
+def _require_rank_major_layer(past_key_values, layer_idx: int) -> None:
+    """Fail clearly when a compressed layer is handed a stock cache layer.
+
+    K is rank-major here, so a DynamicLayer would concatenate it along the rank
+    axis and raise a shape error from inside torch.cat that says nothing about
+    the cause. `replace_attn_with_triton` installs the right cache automatically;
+    this only triggers when a caller passes one of its own.
+    """
+    layers = getattr(past_key_values, "layers", None)
+    if layers is None:
+        return
+    if layer_idx < len(layers):
+        layer_cls = type(layers[layer_idx])
+    else:
+        # The cache grows lazily and will append this class for the new index.
+        layer_cls = getattr(past_key_values, "layer_class_to_replicate", None)
+        if layer_cls is None:
+            return
+    if not issubclass(layer_cls, (RankMajorKLayer, PackedKVLayer)):
+        raise TypeError(
+            f"layer {layer_idx} is compressed and stores K rank-major, but the "
+            f"cache supplied a {layer_cls.__name__}. Pass "
+            f"StarKVCache(num_hidden_layers, skip_layers), or pass no cache at "
+            f"all and let the model build one."
+        )
+
+
+def _expand_ragged_k(key_states: torch.Tensor, k_u: torch.Tensor, segments) -> torch.Tensor:
+    """Rebuild full [B, H, seq, head_dim] keys from the ragged latent cache.
+
+    key_states is rank-major [B, W, seq] with head h at rows [off, off + width_h);
+    only the first `rank_h` of those carry signal, the rest of the tile is zero, so
+    each head is expanded from its real rank.
+
+    Heads have different widths, so this is a loop of small matmuls instead of
+    one batched GEMM. That is fine here because every caller is a reference or
+    baseline path -- the fused decode kernel never materialises full keys.
+    """
+    u = k_u.to(key_states.dtype)
+    return torch.stack(
+        [key_states[:, off:off + r, :].transpose(1, 2) @ u[off:off + r]
+         for off, r in segments],
+        dim=1,
+    )
+
 def _patched_attn_forward(
     self,
     hidden_states: torch.Tensor,
@@ -855,14 +1245,17 @@ def _patched_attn_forward(
     k_vs = self.k_proj.VS
     v_vs = self.v_proj.VS
 
-    k_inter = (
-        torch.matmul(hidden_states, k_vs.weight.T)
-        .view(*input_shape, self.decomp_goup_num_kv, -1)
-        .transpose(1, 2)
-    )
+    # Ragged K latent, rank-major: [B, W, seq]. Heads sit side by side along W at
+    # their own widths -- no per-head view exists (the widths differ) and none is
+    # needed, the decode kernel locates each head through k_proj.offsets. Tokens
+    # are the LAST axis so each head's lanes stay contiguous across them; see
+    # RankMajorKLayer. Producing it as weight @ hidden^T writes that layout
+    # directly instead of transposing a [B, seq, W] result afterwards.
+    k_inter = torch.matmul(k_vs.weight, hidden_states.transpose(1, 2))
     v_inter = torch.matmul(hidden_states, v_vs.weight.T)
 
     if past_key_values is not None:
+        _require_rank_major_layer(past_key_values, self.layer_idx)
         key_states, value_states = past_key_values.update(k_inter, v_inter, self.layer_idx)
     else:
         key_states, value_states = k_inter, v_inter
@@ -894,7 +1287,9 @@ def _patched_attn_forward(
             .transpose(1, 2)
         )
         causal_mask = (
-            attention_mask[:, :, :, : key_states.shape[-2]]
+            # key_states is rank-major [B, W, seq]: the cache length is the LAST
+            # axis, not -2.
+            attention_mask[:, :, :, : key_states.shape[-1]]
             if attention_mask is not None else None
         )
         if causal_mask is None:
@@ -920,15 +1315,26 @@ def _patched_attn_forward(
             # above for every rope type (llama3, yarn, linear, ...).
             attn_weights = _abx(
                 query_states,
-                k_u.transpose(-2, -1).contiguous(),
+                k_u,
                 key_states.contiguous(),
                 ranks=self.k_proj.ranks,
+                offsets=self.k_proj.offsets,
                 inv_freq=self.rope_inv_freq,
                 attn_scaling=self.rope_attn_scaling,
-                dtype=torch.float16,
+                # Compute in the cache's own dtype. This was pinned to float16,
+                # which on a bf16 model rounds the reconstructed K, the cos/sin
+                # and the Q.K product through a format nothing else here uses:
+                # measured 1.0-3.4% slower than bf16 (the fp32->fp16 conversion
+                # costs more than the truncation to bf16), and fp16 tops out at
+                # 65504, which a K summed over up to 80 rank directions can
+                # approach where bf16 -- same exponent range as fp32 -- cannot.
+                # The accumulation is fp32 either way and the logits are stored
+                # in the cache dtype regardless, so the extra fp16 mantissa was
+                # discarded immediately.
+                dtype=key_states.dtype,
             ) / math.sqrt(self.head_dim)
         else:
-            key_full = torch.matmul(key_states, k_u.transpose(-2, -1).to(key_states.dtype))
+            key_full = _expand_ragged_k(key_states, k_u, self.k_proj.segments)
             # The cached keys span absolute positions 0..kv_len-1, but cos/sin
             # from position_embeddings cover only the current query position.
             # Rebuild the full tables rather than letting _rope fall back to
@@ -944,9 +1350,20 @@ def _patched_attn_forward(
             attn_weights = torch.matmul(query_states, key_full.transpose(2, 3)) * self.scaling
 
         if attention_mask is not None:
-            attn_weights = attn_weights + attention_mask[:, :, :, : key_states.shape[-2]]
+            # key_states is rank-major [B, W, seq]; cache length is the last axis.
+            attn_weights = attn_weights + attention_mask[:, :, :, : key_states.shape[-1]]
 
-        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        # `dtype=torch.float32` would materialise the whole attention row in fp32
+        # and immediately cast it back: at 64k x batch 8 that is a 65 MB tensor
+        # written and re-read for nothing, and it costs more than the softmax
+        # itself (396us, against 121us without it). Asking for a bf16 result runs
+        # the same math -- torch reduces and exponentiates in fp32 for a bf16
+        # input -- and rounds once at the end instead of twice.
+        #
+        # Not bitwise identical to the fp32 round trip on long rows: the two
+        # disagree on ~0.3% of outputs by at most one bf16 ulp (3.1e-3 relative,
+        # against bf16's own 3.9e-3 resolution).
+        attn_weights = F.softmax(attn_weights, dim=-1).to(query_states.dtype)
         attn_weights = F.dropout(
             attn_weights,
             p=0.0 if not self.training else self.attention_dropout,
@@ -959,7 +1376,17 @@ def _patched_attn_forward(
         # GEMV per head. The U basis, already broadcast across each GQA group,
         # is precomputed at export time (see VProjInferenceWrapper).
         prob_v = attn_weights.squeeze(2) @ value_states                  # [B, Hq, rank_v]
-        attn_output = prob_v.unsqueeze(-2) @ self.v_proj.U_by_query_head  # [B, Hq, 1, Hd]
+        # Expand with U as a batched GEMM over heads, NOT as [B,Hq,1,rank_v] @
+        # [Hq,rank_v,Hd]. That broadcast form is B*Hq separate problems with
+        # M=1 -- a pile of GEMVs the card cannot fill. Putting the batch in M
+        # instead leaves Hq problems of shape [B,rank_v] @ [rank_v,Hd], which is
+        # bit-for-bit the same arithmetic and measured 7x faster at batch 8,
+        # 17x at batch 16 (456us -> 27us).
+        attn_output = (
+            torch.bmm(prob_v.transpose(0, 1), self.v_proj.U_by_query_head)
+            .transpose(0, 1)                                              # [B, Hq, Hd]
+            .unsqueeze(2)                                                 # [B, Hq, 1, Hd]
+        )
 
     attn_output = attn_output.transpose(1, 2).contiguous()
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()
@@ -985,10 +1412,7 @@ def _bf16_sdpa_fwd(
     v_vs, v_u = self.v_proj.VS, self.v_proj.U
     H, Hd = self.num_key_value_heads, self.head_dim
 
-    k_inter = (
-        torch.matmul(hidden_states, k_vs.weight.T)
-        .view(*input_shape, H, -1).transpose(1, 2)
-    )
+    k_inter = torch.matmul(k_vs.weight, hidden_states.transpose(1, 2))   # [B, W, seq]
     v_inter = torch.matmul(hidden_states, v_vs.weight.T)
 
     if past_key_values is not None:
@@ -997,8 +1421,20 @@ def _bf16_sdpa_fwd(
     cos, sin = position_embeddings
     Q = _rope(Q, cos, sin)
 
-    K_full = torch.matmul(k_inter, k_u.transpose(-2, -1).contiguous())
-    K_full = _rope(K_full, cos, sin)
+    K_full = _expand_ragged_k(k_inter, k_u, self.k_proj.segments)
+    if K_full.shape[-2] == Q.shape[-2]:
+        # Prefill: position_embeddings already covers every position.
+        K_full = _rope(K_full, cos, sin)
+    else:
+        # Decode: the cached keys span absolute positions 0..kv_len-1, but cos/sin
+        # covers only the current query position, so broadcasting it would rotate
+        # every cached key by the newest position and erase relative position.
+        # Same correction _patched_attn_forward's no-Triton branch makes.
+        k_cos, k_sin = _rope_tables(
+            self.rope_inv_freq, K_full.shape[-2],
+            K_full.device, K_full.dtype, self.rope_attn_scaling,
+        )
+        K_full = K_full * k_cos + rotate_half(K_full) * k_sin
     V_full = (
         torch.matmul(v_inter, v_u.weight.T)
         .view(*v_inter.shape[:-1], H, Hd)
@@ -1007,10 +1443,23 @@ def _bf16_sdpa_fwd(
     )
 
     mask = (
-        attention_mask[:, :, :, : k_inter.shape[2]]
+        # k_inter is rank-major [B, W, seq], so the cache length is the last axis.
+        attention_mask[:, :, :, : k_inter.shape[-1]]
         if attention_mask is not None else None
     )
-    out = F.scaled_dot_product_attention(Q, K_full, V_full, attn_mask=mask, scale=self.scaling)
+    # Causal only when this call is a prefill over several queries. At decode the
+    # single query legitimately attends to every cached key, and is_causal there
+    # would align the mask top-left and leave it attending to key 0 alone.
+    # Without this the baseline reads the whole sequence bidirectionally, which
+    # is neither what the model computes nor what it should be timed against.
+    is_causal = mask is None and Q.shape[-2] > 1
+    out = F.scaled_dot_product_attention(
+        Q, K_full, V_full, attn_mask=mask, scale=self.scaling,
+        is_causal=is_causal,
+        # K/V are per KV head; let SDPA broadcast them across each GQA group
+        # rather than silently mismatching the head counts.
+        enable_gqa=self.num_key_value_groups > 1,
+    )
     out = out.transpose(1, 2).contiguous().reshape(*input_shape, -1)
     return self.o_proj(out), None
 
@@ -1024,10 +1473,17 @@ def replace_attn_with_triton(
     config,
     skip_layers: tuple = (0, 1, 31),
     dtype: torch.dtype = torch.bfloat16,
+    kv_quant: bool = False,
 ):
     """Export decomposed K/V projections and install LlamaCustomAttention with
-    the unified prefill+decode forward in all non-skip layers."""
+    the unified prefill+decode forward in all non-skip layers.
+
+    kv_quant=True stores the cache packed to 4 bits and decodes through
+    kv_quant.py's kernels (fold_kv_hadamard must have run on the fused model).
+    """
     num_heads = config.num_attention_heads
+    if kv_quant and config.num_key_value_heads != num_heads:
+        raise NotImplementedError("the kv_quant decode kernels are MHA-only")
 
     # The decode kernel re-derives RoPE for the cached K internally, so it needs
     # the exact frequencies the model uses for Q. 
@@ -1039,6 +1495,7 @@ def replace_attn_with_triton(
         )
     rope_inv_freq = rotary.inv_freq.detach().float()
     rope_attn_scaling = float(getattr(rotary, "attention_scaling", 1.0))
+    compressed_any = False
 
     for i, block in enumerate(model.model.layers):
         if i in set(skip_layers):
@@ -1047,15 +1504,19 @@ def replace_attn_with_triton(
         orig = block.self_attn
         device = next(orig.parameters()).device
 
-        new_attn = LlamaCustomAttention(
-            config, layer_idx=i, decomp_goup_num=num_heads
-        ).to(device=device, dtype=dtype)
+        ratio = getattr(orig.k_proj, "kv_outlier_ratio", None)
+        if kv_quant and ratio is None:
+            raise RuntimeError(f"layer {i}: run fold_kv_hadamard(model) before kv_quant export")
+
+        new_attn = LlamaCustomAttention(config, layer_idx=i).to(device=device, dtype=dtype)
 
         new_attn.q_proj.weight.data.copy_(orig.q_proj.weight.data.to(dtype))
         new_attn.o_proj.weight.data.copy_(orig.o_proj.weight.data.to(dtype))
 
-        k_VS, k_U, k_dense, k_ranks = export_kproj_for_triton(orig.k_proj, dtype=dtype)
-        new_attn.k_proj = KProjInferenceWrapper(k_VS, k_U, k_dense, k_ranks)
+        k_VS, k_U, k_dense, k_ranks, k_offsets = export_kproj_for_triton(
+            orig.k_proj, dtype=dtype
+        )
+        new_attn.k_proj = KProjInferenceWrapper(k_VS, k_U, k_dense, k_ranks, k_offsets)
 
         v_VS, v_U, v_dense = export_vproj_for_triton(orig.v_proj, dtype=dtype)
         # Broadcast the per-KV-head V basis across its GQA group and transpose
@@ -1073,29 +1534,203 @@ def replace_attn_with_triton(
 
         new_attn.register_buffer("rope_inv_freq", rope_inv_freq.to(device), persistent=False)
         new_attn.rope_attn_scaling = rope_attn_scaling
+        if kv_quant:
+            new_attn.kvq = KVQuantMeta(k_ranks, k_offsets, rank_v, ratio).to(device)
 
-        new_attn.forward = types.MethodType(_patched_attn_forward, new_attn)
+        new_attn.forward = types.MethodType(
+            _kv_quant_forward if kv_quant else _patched_attn_forward, new_attn)
         block.self_attn = new_attn
+        compressed_any = True
 
-        if i == 2:
-            # Ranks are per KV head, not per query head -- dividing by
-            # num_attention_heads under-reports by the GQA group size.
-            rk = k_VS.weight.shape[0] // config.num_key_value_heads
-            print(f"  Layer {i}: k rank/kv-head max={rk} "
-                  f"(real per head: {k_ranks.tolist()}), v rank={v_VS.weight.shape[0]}")
-
+    if compressed_any:
+        _install_rank_major_cache(model, config, skip_layers)
     return model
+
+
+def _needs_rank_major_cache(cache) -> bool:
+    """Should this call get a StarKVCache built for it?
+
+    Yes when the caller passed nothing, and also when it passed a stock cache
+    that is still empty: `generate` builds its own DynamicCache before the first
+    forward, and swapping it there is both safe and necessary, since generate
+    carries whatever the first step returns. A cache with tokens already in it is
+    left alone -- replacing it would silently drop them, and
+    _require_rank_major_layer will reject it with an explanation instead.
+    """
+    if cache is None:
+        return True
+    if isinstance(cache, StarKVCache):
+        return False
+    return isinstance(cache, DynamicCache) and cache.get_seq_length() == 0
+
+
+def _install_rank_major_cache(model, config, skip_layers: tuple):
+    """Make the model build a StarKVCache when a caller does not pass one.
+
+    Compressed layers store K rank-major ([B, W, seq]), which the stock
+    DynamicCache cannot hold: it concatenates every layer on dim -2, which for
+    that shape is the rank axis, not the tokens. LlamaModel.forward builds its
+    own DynamicCache whenever use_cache is on and past_key_values is None, so
+    without this every plain `model(..., use_cache=True)` would raise on the
+    second step. Wrapping the inner model's forward keeps that invisible to
+    callers instead of making each one remember to pass a cache.
+    """
+    inner = model.model
+    if getattr(inner, "_starkv_cache_installed", False):
+        return
+    _inner_forward = inner.forward
+    n_layers = config.num_hidden_layers
+    skip = tuple(skip_layers)
+    packed = {i: b.self_attn.kvq for i, b in enumerate(inner.layers) if hasattr(b.self_attn, "kvq")}
+
+    def forward_with_starkv_cache(*args, past_key_values=None, use_cache=None, **kwargs):
+        wants_cache = use_cache if use_cache is not None else bool(model.config.use_cache)
+        if wants_cache and _needs_rank_major_cache(past_key_values):
+            past_key_values = StarKVCache(n_layers, skip, packed)
+        return _inner_forward(*args, past_key_values=past_key_values,
+                              use_cache=use_cache, **kwargs)
+
+    inner.forward = forward_with_starkv_cache
+    inner._starkv_cache_installed = True
 
 
 def set_model_mode(model, mode: str, skip_layers: tuple = (0, 1, 31)):
     """Switch all non-skip attention layers between triton / no_triton / bf16_sdpa."""
+    # The packed cache is readable only by kv_quant's kernels. Refuse before
+    # touching any state, so a rejected call leaves the model as it was.
+    if mode != "triton" and any(hasattr(b.self_attn, "kvq") for b in model.model.layers):
+        raise ValueError("this model uses the 4-bit packed KV cache; only mode='triton' can read it")
     attn_module.triton_kernel = (mode == "triton")
-    attn_module.reorder = True
     for i, block in enumerate(model.model.layers):
         if i in set(skip_layers):
             continue
         attn = block.self_attn
-        if mode in ("triton", "no_triton"):
+        if hasattr(attn, "kvq"):
+            attn.forward = types.MethodType(_kv_quant_forward, attn)
+        elif mode in ("triton", "no_triton"):
             attn.forward = types.MethodType(_patched_attn_forward, attn)
         elif mode == "bf16_sdpa":
             attn.forward = types.MethodType(_bf16_sdpa_fwd, attn)
+
+
+# ---------------------------------------------------------------------------
+# 4-bit KV quantization: an add-on to the low-rank cache (format in kv_quant.py)
+# ---------------------------------------------------------------------------
+
+def _fused_kv_modules(model):
+    for mod in model.modules():
+        if isinstance(mod, (FusedDecomposeLinear, FusedDecomposeLinear_headwise)):
+            yield mod
+
+
+@torch.no_grad()
+def fold_kv_hadamard(model, outlier_ratio: float = kv_quant.OUTLIER_RATIO, seed: int = 1234):
+    """Rotate every fused K/V latent by a block Hadamard, folded into VS and U.
+
+    VS <- T^T VS and U <- U T per head, so the codes are rotated and U undoes it:
+    T is orthonormal, so U T T^T VS == U VS and the model computes the same
+    function. Only the quantizer sees the
+    rotated basis, which spreads a block's range across its channels. Records each
+    head's (start, n_outlier, rank) for fake_quant and the packed cache. Run once,
+    on the fused model, before replace_attn_with_triton.
+    """
+    found = False
+    for mod in _fused_kv_modules(model):
+        if mod.kv_quant_blocks is not None:
+            raise RuntimeError("fold_kv_hadamard has already been applied")
+        ranks = mod._r_list if isinstance(mod, FusedDecomposeLinear_headwise) else [mod.rank]
+        gen = torch.Generator().manual_seed(seed)
+        VS, U = mod.VS.weight.data, mod.U.weight.data
+        blocks, a = [], 0
+        for r in ranks:
+            no = kv_quant.n_outlier(r, outlier_ratio)
+            T = kv_quant.block_hadamard(r, no, gen).to(VS.device)
+            VS[a:a + r] = (T.T @ VS[a:a + r].double()).to(VS.dtype)
+            U[:, a:a + r] = (U[:, a:a + r].double() @ T).to(U.dtype)
+            blocks.append((a, no, r))
+            a += r
+        mod.kv_quant_blocks = blocks
+        mod.kv_outlier_ratio = outlier_ratio
+        found = True
+    if not found:
+        raise RuntimeError("no fused K/V projections found; load a fused checkpoint first")
+
+
+def set_kv_fake_quant(model, enabled: bool = True):
+    """Fake-quantize every fused K/V latent in fp32 -- for measuring accuracy.
+
+    Acts on the plain PyTorch path (the fused modules' forward), so it quantizes
+    every forward, prefill included: a slightly pessimistic bound on the deployed
+    packed cache, whose prefill is exact.
+    """
+    for mod in _fused_kv_modules(model):
+        if mod.kv_quant_blocks is None:
+            raise RuntimeError("run fold_kv_hadamard(model) first")
+        mod.kv_fake_quant = enabled
+
+
+class KVQuantMeta(nn.Module):
+    """Per-layer constants of the 4-bit packed cache, shared by the cache layer
+    (to pack) and the decode forward (to read)."""
+
+    def __init__(self, k_ranks, k_offsets, rank_v: int, outlier_ratio: float):
+        super().__init__()
+        ranks = [int(r) for r in k_ranks.tolist()]
+        widths = [align_up(r, RANK_TILE) for r in ranks]
+        nouts = [kv_quant.n_outlier(r, outlier_ratio) for r in ranks]
+        t = lambda v: torch.tensor(v, dtype=torch.int32)
+        self.register_buffer("ranks", t(ranks), persistent=False)
+        self.register_buffer("offsets", k_offsets.detach().to(torch.int32).cpu(), persistent=False)
+        self.register_buffer("nouts", t(nouts), persistent=False)
+        self.register_buffer("head_of_lane", t([h for h, w in enumerate(widths) for _ in range(w)]),
+                             persistent=False)
+        tile_head, tile_nout, tile_last = kv_quant.k_tile_meta(ranks, nouts, "cpu")
+        self.register_buffer("tile_head", tile_head, persistent=False)
+        self.register_buffer("tile_nout", tile_nout, persistent=False)
+        self.register_buffer("tile_last", tile_last, persistent=False)
+        self.rank_v = int(rank_v)
+        self.nout_v = kv_quant.n_outlier(rank_v, outlier_ratio)
+
+    @property
+    def tiles(self):
+        return self.tile_head, self.tile_nout, self.tile_last
+
+
+def _kv_quant_forward(
+    self,
+    hidden_states: torch.Tensor,
+    position_embeddings: tuple,
+    attention_mask: Optional[torch.Tensor],
+    position_ids: Optional[torch.LongTensor] = None,
+    past_key_values: Optional[Cache] = None,
+    cache_position: Optional[torch.LongTensor] = None,
+    **kwargs,
+):
+    """Attention over the 4-bit packed cache.
+
+    Prefill is the bf16 path's own -- exact, through dense_weight -- and the
+    PackedKVLayer quantizes the codes it writes. Decode reads only the packed
+    cache: fold_q + abx_z for the logits, pv_fold for P @ V.
+    """
+    if hidden_states.shape[1] > 1 or past_key_values is None:
+        return _patched_attn_forward(self, hidden_states, position_embeddings, attention_mask,
+                                     position_ids, past_key_values, cache_position, **kwargs)
+    B = hidden_states.shape[0]
+    q = self.q_proj(hidden_states).view(B, 1, -1, self.head_dim).transpose(1, 2)
+    q = _rope(q, *position_embeddings)
+    k_inter = torch.matmul(self.k_proj.VS.weight, hidden_states.transpose(1, 2))    # [B, W, 1]
+    v_inter = torch.matmul(hidden_states, self.v_proj.VS.weight.T)                  # [B, 1, rank_v]
+    past_key_values.update(k_inter, v_inter, self.layer_idx)
+    lay = past_key_values.layers[self.layer_idx]
+    if not isinstance(lay, PackedKVLayer):
+        raise TypeError(f"layer {self.layer_idx} decodes from the packed cache but got a "
+                        f"{type(lay).__name__}; pass no cache and let the model build one")
+    m = self.kvq
+    ab = kv_quant.fold_q(q, self.k_proj.U, m.head_of_lane, self.scaling, self.rope_attn_scaling)
+    logits = kv_quant.abx_z(ab, lay.keys, lay.key_scales, m.tiles, self.rope_inv_freq)
+    if attention_mask is not None:
+        logits = logits + attention_mask[:, :, :, : logits.shape[-1]]
+    p = F.softmax(logits, dim=-1).to(q.dtype)
+    pv = kv_quant.pv_fold(p.squeeze(2), lay.values, lay.value_scales, m.nout_v, m.rank_v)
+    out = torch.bmm(pv.to(q.dtype).transpose(0, 1), self.v_proj.U_by_query_head).transpose(0, 1)
+    return self.o_proj(out.reshape(B, 1, -1)), None

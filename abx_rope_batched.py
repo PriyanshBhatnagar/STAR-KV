@@ -3,20 +3,20 @@
 Implements the fused ABX operation: out = A @ (B @ X^T + RoPE(B @ X^T))
 where:
     A: query states       (batch, num_heads, 1, head_dim)
-    B: U^T of K SVD      (num_kv_heads, max_rank, head_dim)
-    X: compressed K cache (batch, num_groups, seq_len, max_rank)
+    B: U^T of K SVD       (total_width, head_dim)
+    X: compressed K cache (batch, total_width, seq_len)
 
-Heads keep different numbers of singular directions, so the rank is passed as a
-per-KV-head vector rather than one scalar shared by every head:
+Heads keep different numbers of singular directions. Each KV head is stored at
+its own width (its rank rounded up to BLOCK_SIZE_R), side by side along one
+flat rank axis, and found through a per-head offset. The rank is passed as a
+per-KV-head vector, so the GEMM trip count varies per head too:
 
     R = tl.load(r_ptr + kv_head)          # per-head trip count
 
-Storage stays padded to the layer's max rank with uniform strides -- only the
-GEMM trip count varies per head, so a head that kept 30 of 94 directions stops
-after 2 blocks instead of 6. Padded rows of B and X are zero, so stopping early
-is exact, not an approximation; --check asserts bit-equality against a
-full-rank run. Differing trip counts across program ids is block-level
-divergence, not warp divergence, so there is no intra-warp penalty.
+A head that kept 30 directions stops after 2 tiles, and the tail of its last
+tile is masked, so it is never read; --check asserts that garbage there leaves
+the result bit-identical. Differing trip counts across program ids is
+block-level divergence, not warp divergence, so there is no intra-warp penalty.
 
 Run `python abx_rope_batched.py --check` to verify correctness.
 Run `python abx_rope_batched.py` to benchmark across sequence lengths.
@@ -76,10 +76,10 @@ def get_configs():
 )
 @triton.jit
 def _abx_fwd(
-    a_ptr, b_ptr, x_ptr, out_ptr, r_ptr, inv_freq_ptr,
+    a_ptr, b_ptr, x_ptr, out_ptr, r_ptr, inv_freq_ptr, off_ptr,
     stride_ab, stride_az, stride_aa, stride_ad,
-    stride_bz, stride_br, stride_bd,
-    stride_xb, stride_xhg, stride_xl, stride_xr,
+    stride_br, stride_bd,
+    stride_xb, stride_xl, stride_xr,
     stride_ob, stride_oz, stride_oa, stride_ol,
     D, seq_len,
     dtype_tl: tl.constexpr,
@@ -90,8 +90,11 @@ def _abx_fwd(
     GROUP_SIZE: tl.constexpr,
     ATTN_SCALING: tl.constexpr,
 ):
-    pid_b = tl.program_id(axis=0)
-    pid_h = tl.program_id(axis=1)
+    # int64: pid_b * stride_xb overflows int32 once the K cache passes 2^31
+    # elements (e.g. bs=16, seq=64k, 32 heads, rank 80 = 2.6e9), and the wrapped
+    # pointer reads whatever else is resident instead of faulting.
+    pid_b = tl.program_id(axis=0).to(tl.int64)
+    pid_h = tl.program_id(axis=1).to(tl.int64)
     pid_l = tl.program_id(axis=2)
 
     # GROUP_SIZE = num_query_heads // num_kv_groups (query heads sharing one KV head).
@@ -107,10 +110,13 @@ def _abx_fwd(
     offs_ls = (pid_l * BLOCK_SIZE_L) + tl.arange(0, BLOCK_SIZE_L)
 
     A_ptrs = a_ptr + pid_b * stride_ab + pid_h * stride_az + (0 * stride_aa + offs_ds[None, :] * stride_ad)
-    # B (k_u U^T) is stored per KV head, so it is indexed by the KV group, not the
-    # query head. For MHA (GROUP_SIZE=1) HEAD_GROUPS_ID == pid_h, so this is a no-op.
-    B_ptrs = b_ptr + HEAD_GROUPS_ID * stride_bz + (offs_rs[:, None] * stride_br + offs_ds[None, :] * stride_bd)
-    X_ptrs = x_ptr + pid_b * stride_xb + HEAD_GROUPS_ID * stride_xhg + (offs_ls[:, None] * stride_xl + offs_rs[None, :] * stride_xr)
+    # Heads sit side by side in one flat rank axis, each at its own width, so the
+    # head is addressed by a column OFFSET rather than by a uniform per-head
+    # stride. X is [B, W, L] and B (k_u U^T) is [W, D], with head h occupying
+    # rows [off_h, off_h + width_h).
+    col_off = tl.load(off_ptr + HEAD_GROUPS_ID).to(tl.int64)
+    B_ptrs = b_ptr + col_off * stride_br + (offs_rs[:, None] * stride_br + offs_ds[None, :] * stride_bd)
+    X_ptrs = x_ptr + pid_b * stride_xb + col_off * stride_xr + (offs_ls[:, None] * stride_xl + offs_rs[None, :] * stride_xr)
     O_ptrs = out_ptr + pid_b * stride_ob + pid_h * stride_oz + (0 * stride_oa + offs_ls[None, :] * stride_ol)
 
     xb_0 = tl.zeros((BLOCK_SIZE_L, BLOCK_SIZE_D), dtype=tl.float32)
@@ -159,17 +165,26 @@ def _abx_fwd(
 
 
 def abx(a: torch.Tensor, b: torch.Tensor, x: torch.Tensor,
-        ranks: torch.Tensor = None, inv_freq: torch.Tensor = None,
-        attn_scaling: float = 1.0, dtype=torch.float16) -> torch.Tensor:
+        ranks: torch.Tensor, offsets: torch.Tensor,
+        inv_freq: torch.Tensor = None, attn_scaling: float = 1.0,
+        dtype=torch.float16) -> torch.Tensor:
     """Fused A @ (B @ X^T + RoPE) for decode-step attention.
+
+    x is (batch, total_width, seq_len) -- rank-major, tokens LAST -- and b is
+    (total_width, head_dim). KV head h occupies the half-open range
+    [offsets[h], offsets[h] + width_h) of the rank axis, where width_h is its
+    rank rounded up to BLOCK_SIZE_R, so the cache holds only what each head
+    kept, and tokens being last keeps a head's lanes contiguous across them.
 
     Args:
         a: query states, shape (batch, num_heads, 1, head_dim)
-        b: K projection U^T, shape (num_kv_heads, max_rank, head_dim)
-        x: compressed K cache, shape (batch, num_groups, seq_len, max_rank)
-        ranks: int32 tensor (num_groups,), real rank kept per KV head. Entries
-               past ranks[h] must be zero in b and x. None means every head
-               uses the full padded rank (the old uniform behaviour).
+        b: K projection U^T, shape (total_width, head_dim)
+        x: compressed K cache, shape (batch, total_width, seq_len)
+        ranks: int32 tensor (num_groups,), real rank kept per KV head. The
+               kernel stops at ranks[h], so the rest of a head's last tile is
+               never read.
+        offsets: int32 tensor (num_groups,), per-head column offset into the
+               flat rank axis.
         inv_freq: RoPE inverse frequencies, shape (head_dim // 2,). Pass the
                model's own `model.model.rotary_emb.inv_freq` -- it already
                encodes the rope type (llama3/yarn/linear/...). None falls back
@@ -183,22 +198,21 @@ def abx(a: torch.Tensor, b: torch.Tensor, x: torch.Tensor,
         attention logits, shape (batch, num_heads, 1, seq_len)
     """
     assert a.dim() == 4
-    assert b.dim() == 3
-    assert x.dim() == 4
+    assert b.dim() == 2, f"expected b [total_width, head_dim], got {tuple(b.shape)}"
+    assert x.dim() == 3, f"expected x [batch, total_width, seq_len], got {tuple(x.shape)}"
 
-    # a is per query head (num_heads); b is per KV head (num_groups). Keep them
-    # distinct — do NOT let b's head count clobber num_heads (breaks GQA grids).
+    # a is per query head (num_heads); ranks/offsets are per KV head (num_groups).
+    # Keep them distinct (GQA grids depend on it).
     batch_size, num_heads, _, head_dim = a.shape
-    _num_kv_heads, max_rank, head_dim = b.shape
-    batch_size, num_groups, seq_len, max_rank = x.shape
-
-    if ranks is None:
-        ranks = torch.full((num_groups,), max_rank, dtype=torch.int32, device=x.device)
-    else:
-        assert ranks.numel() == num_groups, (
-            f"ranks has {ranks.numel()} entries but x has {num_groups} KV groups"
-        )
-        ranks = ranks.to(device=x.device, dtype=torch.int32).contiguous()
+    total_width, head_dim = b.shape
+    batch_size, x_width, seq_len = x.shape
+    assert x_width == total_width, (
+        f"x has {x_width} rank columns but b has {total_width}")
+    num_groups = offsets.numel()
+    assert ranks.numel() == num_groups, (
+        f"ranks has {ranks.numel()} entries but offsets has {num_groups}")
+    ranks = ranks.to(device=x.device, dtype=torch.int32).contiguous()
+    offsets = offsets.to(device=x.device, dtype=torch.int32).contiguous()
 
     if inv_freq is None:
         # Default RoPE, theta=10000. Only correct for models that actually use it.
@@ -207,6 +221,13 @@ def abx(a: torch.Tensor, b: torch.Tensor, x: torch.Tensor,
     inv_freq = inv_freq.to(device=x.device, dtype=torch.float32).contiguous()
     assert inv_freq.numel() == head_dim // 2, (
         f"inv_freq has {inv_freq.numel()} entries, expected head_dim//2 = {head_dim // 2}"
+    )
+    # The kernel splits head_dim into two BLOCK_SIZE_D=64 halves for rotate_half
+    # and get_freq_multi_tokens loads a fixed 64 inverse frequencies, so head_dim
+    # is not a free parameter. Without this check a 64-wide head reads past the
+    # end of inv_freq and returns garbage instead of failing.
+    assert head_dim == 128, (
+        f"the fused kernel is specialised for head_dim=128, got {head_dim}"
     )
 
     out = torch.empty((batch_size, num_heads, 1, seq_len), dtype=x.dtype, device=x.device)
@@ -224,10 +245,12 @@ def abx(a: torch.Tensor, b: torch.Tensor, x: torch.Tensor,
 
     grid = lambda META: (batch_size, num_heads, triton.cdiv(seq_len, META["BLOCK_SIZE_L"]))
     _abx_fwd[grid](
-        a, b, x, out, ranks, inv_freq,
+        a, b, x, out, ranks, inv_freq, offsets,
         a.stride(0), a.stride(1), a.stride(2), a.stride(3),
-        b.stride(0), b.stride(1), b.stride(2),
-        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        b.stride(0), b.stride(1),
+        # x is [B, W, L]: the token stride is the LAST axis, the rank stride the
+        # middle one.
+        x.stride(0), x.stride(2), x.stride(1),
         out.stride(0), out.stride(1), out.stride(2), out.stride(3),
         D=head_dim,
         seq_len=seq_len,
@@ -240,22 +263,25 @@ def abx(a: torch.Tensor, b: torch.Tensor, x: torch.Tensor,
     return out
 
 
-def torch_abx(a, b, x, dtype=torch.float16):
+def torch_abx(a, b, x, ranks, offsets, dtype=torch.float16):
     """Reference PyTorch implementation of the fused ABX+RoPE operation.
 
-    Shapes match the kernel: b and x are indexed per KV head, a per query head,
-    and query head h reads KV head h // (num_q_heads // num_kv_heads).
+    Shapes match the kernel. Each KV head's keys are rebuilt from its own rank
+    only, and query head h reads KV head h // (num_q_heads // num_kv_heads).
     """
-    batch, num_q_heads, _, head_dim = a.shape
-    num_kv_heads = x.shape[1]
+    num_q_heads = a.shape[1]
+    num_kv_heads = offsets.numel()
     group_size = num_q_heads // num_kv_heads
 
     # Reconstruct full K per KV head: (batch, num_kv_heads, seq_len, head_dim)
-    xb = x.float() @ b.float().unsqueeze(0)
+    xb = torch.stack([
+        x[:, o:o + r, :].float().transpose(1, 2) @ b[o:o + r].float()
+        for o, r in zip(offsets.tolist(), ranks.tolist())
+    ], dim=1)
 
     config = LlamaConfig()
     rotary_emb = LlamaRotaryEmbedding(config=config).to(xb.device)
-    position_ids = torch.arange(0, x.shape[-2], device=xb.device).unsqueeze(0)
+    position_ids = torch.arange(0, x.shape[-1], device=xb.device).unsqueeze(0)
     cos, sin = rotary_emb(xb, position_ids)
     xb_rope = apply_rotary_pos_emb_custom(x=xb, cos=cos, sin=sin)
 
@@ -264,102 +290,65 @@ def torch_abx(a, b, x, dtype=torch.float16):
     return (a.float() @ xb_rope.transpose(-1, -2)).to(dtype)
 
 
+def random_ragged_cache(batch_size, num_groups, max_rank, seq_len, head_dim,
+                        dtype=torch.float16, device="cuda"):
+    """Random per-KV-head ranks in [8, max_rank] and a ragged B/X built for them."""
+    ranks = torch.randint(8, max_rank + 1, (num_groups,), dtype=torch.int32)
+    widths = (ranks + 15) // 16 * 16
+    offsets = (torch.cumsum(widths, 0) - widths).to(torch.int32)
+    total_width = int(widths.sum())
+    B = torch.randn(total_width, head_dim, dtype=dtype, device=device)
+    X = torch.randn(batch_size, total_width, seq_len, dtype=dtype, device=device)
+    return B, X, ranks.to(device), offsets.to(device), widths.tolist()
+
+
 def run_benchmark(args):
-    configs = [
-        triton.testing.Benchmark(
-            x_names=["seq_len"],
-            x_vals=args.target_seq_lens,
-            line_arg="provider",
-            line_vals=["WX", "torch", "ours"],
-            line_names=["WX", "Torch", "Ours"],
-            styles=[("gray", "--"), ("green", "--"), ("blue", "-")],
-            ylabel="us",
-            plot_name=f"low-rank-rank-{args.total_rank}-group-{args.num_groups}",
-            args={
-                "dtype": torch.float16,
-                "num_heads": args.num_heads,
-                "head_dim": args.head_dim,
-                "total_rank": args.total_rank,
-                "num_groups": args.num_groups,
-            },
-        )
-    ]
-
-    @triton.testing.perf_report(configs)
-    def bench_low_rank(num_heads, head_dim, total_rank, seq_len, num_groups, provider, dtype=torch.float16, device="cuda"):
-        rank_per_groups = total_rank // num_groups
-        warmup = 25
-        rep = 100
-        A = torch.randn(num_heads, 1, head_dim, dtype=dtype, device=device)
-        B = torch.randn(num_heads, rank_per_groups, head_dim, dtype=dtype, device=device)
-        X = torch.randn(num_groups, seq_len, rank_per_groups, dtype=dtype, device=device)
-        org_A = torch.randn(num_heads, 1, head_dim, dtype=dtype, device=device)
-        org_X = torch.randn(num_heads, seq_len, head_dim, dtype=dtype, device=device)
-
-        quantiles = [0.5, 0.2, 0.8]
-        if provider == "torch":
-            fn = lambda: torch_abx(A, B, X)
-        elif provider == "ours":
-            fn = lambda: abx(A, B, X)
-        elif provider == "WX":
-            fn = lambda: torch.matmul(org_A, org_X.transpose(-1, -2))
-
-        ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=quantiles, warmup=warmup, rep=rep)
-        return ms * 1000, min_ms * 1000, max_ms * 1000
-
-    import os
-    os.makedirs('results', exist_ok=True)
-    bench_low_rank.run(print_data=True, show_plots=True, save_path='results/')
+    print(f"{'seq_len':>8} {'dense QK^T (us)':>16} {'abx (us)':>10} {'speedup':>8}")
+    for seq_len in args.target_seq_lens:
+        A = torch.randn(args.batch_size, args.num_heads, 1, args.head_dim,
+                        dtype=torch.float16, device="cuda")
+        B, X, ranks, offsets, _ = random_ragged_cache(
+            args.batch_size, args.num_groups, args.max_rank, seq_len, args.head_dim)
+        K = torch.randn(args.batch_size, args.num_heads, seq_len, args.head_dim,
+                        dtype=torch.float16, device="cuda")
+        t_ours = triton.testing.do_bench(lambda: abx(A, B, X, ranks, offsets))
+        t_dense = triton.testing.do_bench(lambda: A @ K.transpose(-1, -2))
+        print(f"{seq_len:>8} {t_dense * 1000:>16.1f} {t_ours * 1000:>10.1f} "
+              f"{t_dense / t_ours:>7.2f}x")
 
 
 def run_test(args):
-    num_heads = args.num_heads
-    head_dim = args.head_dim
-    total_rank = args.total_rank
-    seq_len = 1024
-    batch_size = 4
-    num_groups = args.num_groups
-    rank_per_groups = total_rank // num_groups
-    dtype = torch.float16
-    device = "cuda"
+    batch_size, seq_len, dtype = 4, 1024, torch.float16
+    A = torch.randn(batch_size, args.num_heads, 1, args.head_dim, dtype=dtype, device="cuda")
+    B, X, ranks, offsets, widths = random_ragged_cache(
+        batch_size, args.num_groups, args.max_rank, seq_len, args.head_dim, dtype)
+    print(f"  ranks    : {ranks.tolist()}")
 
-    # B and X are per KV head (num_groups), A is per query head (num_heads).
-    A = torch.randn(batch_size, num_heads, 1, head_dim, dtype=dtype, device=device)
-    B = torch.randn(num_groups, rank_per_groups, head_dim, dtype=dtype, device=device)
-    X = torch.randn(batch_size, num_groups, seq_len, rank_per_groups, dtype=dtype, device=device)
-
-    axb = torch_abx(A, B, X, dtype)
-    ours = abx(A, B, X, dtype=dtype)
-
-    denom = axb.float().abs().mean().clamp_min(1e-6)
-    print(f"Mean abs diff vs torch reference: {(axb - ours).float().abs().mean().item():.4f} "
+    ref = torch_abx(A, B, X, ranks, offsets, dtype)
+    ours = abx(A, B, X, ranks, offsets, dtype=dtype)
+    denom = ref.float().abs().mean().clamp_min(1e-6)
+    print(f"  mean abs diff vs torch reference: {(ref - ours).float().abs().mean().item():.4f} "
           f"(mean |ref| = {denom.item():.4f})")
 
-    # Per-head dynamic rank must be bit-identical to running at full padded rank,
-    # since everything past ranks[h] is zero in both B and X.
-    print("\nPer-head dynamic rank vs full-rank (padded tail zeroed):")
-    torch.manual_seed(0)
-    ranks = torch.randint(8, rank_per_groups + 1, (num_groups,), dtype=torch.int32)
-    Bd = torch.randn(num_groups, rank_per_groups, head_dim, dtype=dtype, device=device)
-    Xd = torch.randn(batch_size, num_groups, seq_len, rank_per_groups, dtype=dtype, device=device)
-    for h in range(num_groups):
-        Bd[h, ranks[h]:, :] = 0
-        Xd[:, h, :, ranks[h]:] = 0
-
-    full = abx(A, Bd, Xd, dtype=dtype)
-    dyn = abx(A, Bd, Xd, ranks=ranks, dtype=dtype)
-    max_diff = (full.float() - dyn.float()).abs().max().item()
-    print(f"  ranks    : {ranks.tolist()}  (padded to {rank_per_groups})")
-    print(f"  max diff : {max_diff:.3e}")
-    print("  PASS" if max_diff == 0.0 else "  FAIL (expected bit-exact)")
+    # The kernel must stop at each head's rank: zeroing the rest of every
+    # head's last tile cannot change a single bit of the result.
+    Bz, Xz = B.clone(), X.clone()
+    for o, r, w in zip(offsets.tolist(), ranks.tolist(), widths):
+        Bz[o + r:o + w] = 0
+        Xz[:, o + r:o + w] = 0
+    max_diff = (abx(A, Bz, Xz, ranks, offsets, dtype=dtype).float() - ours.float()).abs().max().item()
+    print(f"  tile tail ignored: max diff {max_diff:.3e}  "
+          + ("PASS" if max_diff == 0.0 else "FAIL (expected bit-exact)"))
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Benchmark or test the fused ABX+RoPE Triton kernel.")
-    parser.add_argument("--total_rank", type=int, default=int(4096 * 0.2), help="Total compressed ranks")
+    parser.add_argument("--max_rank", type=int, default=80,
+                        help="Per-KV-head ranks are drawn uniformly from [8, max_rank]")
     parser.add_argument("--num_heads", type=int, default=32, help="Number of attention heads (32 for LLaMA-7B)")
     parser.add_argument("--head_dim", type=int, default=128, help="Head dimension (128 for LLaMA-7B)")
     parser.add_argument("--group_size", type=int, default=4, help="Number of heads per KV group (for GQA models). For MHA choose 1")
+    parser.add_argument("--batch_size", type=int, default=1, help="Batch size for the benchmark")
     parser.add_argument("--target_seq_lens", nargs="+", type=int, default=[4096, 16384, 65536, 262144])
     parser.add_argument("--check", action="store_true", help="Run correctness check instead of benchmark")
     return parser.parse_args()
@@ -367,14 +356,12 @@ def parse_args():
 
 def main(args):
     args.num_groups = args.num_heads // args.group_size
-    args.group_rank = args.total_rank // args.num_groups
-    print("Benchmarking fused low-rank KV Cache kernel (ABX+RoPE)...")
-    print(f"  Total rank:    {args.total_rank}")
+    print("Fused low-rank KV Cache kernel (ABX+RoPE)")
     print(f"  Heads:         {args.num_heads}")
     print(f"  Head dim:      {args.head_dim}")
     print(f"  Group size:    {args.group_size}")
     print(f"  Groups:        {args.num_groups}")
-    print(f"  Rank/group:    {args.group_rank}")
+    print(f"  Max rank:      {args.max_rank}")
     if args.check:
         run_test(args)
     else:

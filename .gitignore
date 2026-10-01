@@ -5,14 +5,13 @@ __pycache__/
 dist/
 build/
 .env
+.claude/
+.DS_Store
+.ipynb_checkpoints/
+
+# Artifacts: checkpoints, eval output, logs
 *.pt
 *.bin
 *.safetensors
-.DS_Store
-.ipynb_checkpoints/
-train_eval.ipynb
+*.log
 results/
-.gitignore
-.claude
-layerwise_absorbed.py
-previous.ipynb

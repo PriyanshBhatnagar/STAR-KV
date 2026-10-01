@@ -17,10 +17,15 @@ Training runs in two phases, then fuses:
 
 Compression budget
 ------------------
-  --desired-comp-rate C  sets the overall KV compression fraction (fraction of params removed).
-  C=0.6 means 60% of KV parameters are pruned; only 40% of full-rank capacity remains.
-  For the headwise-K / joint-V hybrid, K targets C+0.10 and V targets C-0.10 compression,
-  so the average equals C.  Example: C=0.6 → K removes 70% (30% remains), V removes 50%.
+  --desired-comp-rate C  sets the overall KV cache compression over the COMPRESSED
+  layers only -- skipped layers appear in neither numerator nor denominator, so C=0.75
+  with --skip-layers 0 1 2 31 means ~75% across the remaining 28 layers.
+
+  V is more sensitive than K, so it keeps more rank: K targets C+delta, V targets
+  C-delta, with delta scheduled so the size-weighted overall is exactly C.
+      C = 0.60  ->  K removes 70%, V removes 50%   (delta 0.10)
+      C = 0.75  ->  K removes 80%, V removes 70%   (delta 0.05)
+  Linear between those anchors, flat outside; override with --kv-split-offset.
 
 Example
 -------
@@ -48,11 +53,18 @@ from transformers import (
 from tqdm import tqdm
 
 from model import (
+    RANK_TILE,
     enforce_rank_floor,
     fuse_and_prune,
     replace_linear_layer,
     collect_K_parameter_size,
     collect_V_parameter_size,
+    DecomposeLinear_headwise,
+    collect_K_cache_size,
+    collect_V_cache_size,
+    full_K_cache_size,
+    full_V_cache_size,
+    freeze_ranks_at_multiple,
 )
 
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -149,10 +161,12 @@ def parse_args():
                    help="Maximum blocks in phase 1 (step-count fallback); phase 2 "
                         "starts earlier if --desired-comp-rate budget is reached first")
     p.add_argument("--desired-comp-rate", type=float, default=0.6,
-                   help="Overall KV compression fraction (fraction of params removed). "
-                        "0.6 means 60%% compressed, so 40%% of full-rank capacity remains. "
-                        "K targets rate+0.10, V targets rate-0.10 compression "
-                        "(e.g. 0.6 → K removes 70%%, V removes 50%%). "
+                   help="Overall KV cache compression over the COMPRESSED layers only "
+                        "(skipped layers are in neither numerator nor denominator). "
+                        "0.6 means 60%% removed, so 40%% of full-rank capacity remains. "
+                        "K targets rate+delta and V targets rate-delta so the size-weighted "
+                        "overall is exactly this value: 0.60 -> K 70%%/V 50%%, "
+                        "0.75 -> K 80%%/V 70%% (see --kv-split-offset). "
                         "Phase 2 starts once both targets are met or --alpha-samples is exhausted.")
     p.add_argument("--kd-weight", type=float, default=1.0,
                    help="Weight for the knowledge-distillation KL loss")
@@ -171,6 +185,52 @@ def parse_args():
                    help="Attention layer indices to leave uncompressed")
     p.add_argument("--log-steps", type=int, default=100,
                    help="Print training stats and save checkpoint every N steps")
+    p.add_argument("--kv-split-offset", type=float, default=-1.0,
+                   help="How far K and V targets sit either side of --desired-comp-rate: "
+                        "K targets C+offset, V targets C-offset, so the size-weighted "
+                        "overall stays exactly C. V is the more sensitive projection and "
+                        "keeps more rank. Default (-1) interpolates the anchors "
+                        "C=0.60 -> K 70%%/V 50%% (offset 0.10) and C=0.75 -> K 80%%/V 70%% "
+                        "(offset 0.05), held flat outside that range.")
+    p.add_argument("--rank-multiple", type=int, default=0,
+                   help="Before phase 2, round every K head's surviving rank UP to a "
+                        "multiple of this, by lowering its alpha. The decode kernel "
+                        "walks the rank dim in BLOCK_SIZE_R=16 tiles and masks the "
+                        "tail, so 16 adds directions inside tiles already being "
+                        "issued: +22%% K directions for +0%% kernel tiles on "
+                        "Llama-3.2-3B, i.e. free in LATENCY. Not free in memory: "
+                        "it costs ~2.5 points of compression. K only. 0 (default) "
+                        "disables. Phase 2 then recovers "
+                        "into the restored directions.")
+    p.add_argument("--rank-multiple-v", type=int, default=0,
+                   help="Same rounding for the V rank. NOT free the way K is: V is a "
+                        "single global factorisation consumed by a plain probs@V GEMM, "
+                        "so no tile-masking is already paying for the surplus. It may "
+                        "still help that GEMM (a rank_v of 10 runs a 16-wide tile "
+                        "anyway), but it is a straight memory trade. 0 (default) leaves "
+                        "V alone.")
+    p.add_argument("--budget-basis", default="pre-level",
+                   choices=["pre-level", "post-level"],
+                   help="Which ranks --desired-comp-rate is measured against. "
+                        "'pre-level' (default): the raw phase-1 ranks, BEFORE the "
+                        "phase-2 round-up to --rank-multiple. Phase 1 stops at the "
+                        "target and the round-up is then spent on accuracy, so the "
+                        "fused checkpoint ends up LESS compressed than the number you "
+                        "asked for (~6 points on Llama-3.2-3B at multiple 16). "
+                        "'post-level': measure the rounded ranks, so the fused "
+                        "checkpoint lands exactly on --desired-comp-rate and phase 1 "
+                        "has to overshoot to get there. Either way the 'after freeze' "
+                        "line reports the TRUE achieved compression -- quote that one, "
+                        "not the target.")
+    p.add_argument("--comp-metric", default="cache", choices=["cache", "legacy"],
+                   help="What --desired-comp-rate is measured against. 'cache' (default) "
+                        "counts KV CACHE elements per token (rank vs out_features) -- "
+                        "the quantity that actually ships. 'legacy' reproduces the old "
+                        "behaviour, which counted projection WEIGHT parameters "
+                        "((in+out)*rank vs in*out); that differs from the cache by "
+                        "(in+out)/in, i.e. 2.00x for MHA and 1.33x for GQA, and "
+                        "saturates at 0%% until rank < in*out/(in+out). Both numbers "
+                        "are printed either way.")
     p.add_argument("--phase3-samples", type=int, default=0,
                    help="Optional KD-only fine-tune steps AFTER Sigma is fused into V. "
                         "0 (default) skips it; fusion is exact, so this is pure extra "
@@ -238,18 +298,163 @@ def main():
     # ── Compression budget (compute full-rank baselines before any training) ─
     # At init all singular values > alpha=0, so equal=True returns in*out for each layer.
     # comp_rate is the fraction REMOVED: 0.7 = 70% compressed, only 30% of full dim remains.
-    full_k_params = collect_K_parameter_size(model, equal=True)
-    full_v_params = collect_V_parameter_size(model, equal=True)
-    k_off, v_off = (0.09, 0.11) if args.desired_comp_rate <= 0.60 else (0.045, 0.055)
-    k_comp_rate = min(args.desired_comp_rate + k_off, 0.99)
-    v_comp_rate = max(args.desired_comp_rate - v_off, 0.01)
+    # Skipped layers are decomposed by neither replace_linear_layer nor counted
+    # by the collectors, so they appear in NEITHER numerator nor denominator:
+    # a 75% target over the compressed layers prints 75%, not less.
+    _n_compressed = len(model.model.layers) - len(set(args.skip_layers))
+    _mult = max(args.rank_multiple, 1)
+    _mult_v = max(args.rank_multiple_v, 1)
+
+    # Which ranks the phase-1 budget is checked against. "pre-level" measures the
+    # raw ranks, so the phase-2 round-up lands on top of the target and the final
+    # checkpoint is less compressed than requested; "post-level" measures the
+    # rounded ranks, so the final checkpoint lands exactly on the target.
+    _bud_k = 1 if args.budget_basis == "pre-level" else _mult
+    _bud_v = 1 if args.budget_basis == "pre-level" else _mult_v
+
+    if args.comp_metric == "cache":
+        # KV cache elements per token -- the quantity that actually ships.
+        full_k_params = full_K_cache_size(model)
+        full_v_params = full_V_cache_size(model)
+        # The export stores every K head at its rank rounded up to RANK_TILE,
+        # so a budget measured below that granularity would stop at a size the
+        # checkpoint cannot have. Round the measure up to the tile; for K,
+        # --budget-basis then only changes anything when --rank-multiple is
+        # coarser than the tile.
+        _meas_mult_k = max(_bud_k, RANK_TILE)
+        meas_k = lambda m: collect_K_cache_size(m, _meas_mult_k)
+        meas_v = lambda m: collect_V_cache_size(m, _bud_v)
+    else:
+        # Legacy: projection WEIGHT parameters, (in+out)*rank vs in*out.
+        full_k_params = collect_K_parameter_size(model, equal=True)
+        full_v_params = collect_V_parameter_size(model, equal=True)
+        meas_k = lambda m: collect_K_parameter_size(m, equal=True)
+        meas_v = lambda m: collect_V_parameter_size(m, equal=True)
+
+    # Reference totals for the report, independent of which metric drives the budget.
+    _fk_cache, _fv_cache = full_K_cache_size(model), full_V_cache_size(model)
+    _fk_w = collect_K_parameter_size(model, equal=True)
+    _fv_w = collect_V_parameter_size(model, equal=True)
+
+    def _ratio_in_out(m):
+        """(in+out)/in for the K projection: 2.00 for MHA, ~1.33 for GQA."""
+        for name, mod in m.named_modules():
+            if isinstance(mod, DecomposeLinear_headwise) and "k_proj" in name:
+                return (mod.in_features + mod.out_features) / mod.in_features
+        return float("nan")
+
+    def comp_report(m, mk: int = 1, mv: int = 1):
+        """Both accountings. Defaults to mk=mv=1, i.e. what the model HAS
+        right now -- after the phase-2 freeze the ranks are already rounded, so
+        this is the true achieved compression. Pass mk=_mult to project where
+        the round-up will land while phase 1 is still running."""
+        # What the export actually allocates: per-head widths, each rounded up to
+        # RANK_TILE. This is the honest headline.
+        ks = collect_K_cache_size(m, max(mk, RANK_TILE))
+        v = collect_V_cache_size(m, mv)
+        kw, vw = collect_K_parameter_size(m, equal=True), collect_V_parameter_size(m, equal=True)
+        return (
+            f"cache K={1-ks/_fk_cache:.2%} V={1-v/_fv_cache:.2%} "
+            f"KV={1-(ks+v)/(_fk_cache+_fv_cache):.2%} | "
+            f"legacy-weights K={1-kw/_fk_w:.2%} V={1-vw/_fv_w:.2%}"
+        )
+
+    # ── Split the overall budget between K and V ─────────────────────────────
+    # V is the more sensitive projection, so it keeps more rank: K targets
+    # C + delta, V targets C - delta. Anchors:
+    #     C = 0.60  ->  K 70% / V 50%   (delta = 0.10)
+    #     C = 0.75  ->  K 80% / V 70%   (delta = 0.05)
+    # Linear between them, held flat outside. --kv-split-offset overrides.
+    C = args.desired_comp_rate
+    if args.kv_split_offset >= 0.0:
+        delta = args.kv_split_offset
+    else:
+        (c_lo, d_lo), (c_hi, d_hi) = (0.60, 0.10), (0.75, 0.05)
+        if C <= c_lo:
+            delta = d_lo
+        elif C >= c_hi:
+            delta = d_hi
+        else:
+            delta = d_lo + (C - c_lo) * (d_hi - d_lo) / (c_hi - c_lo)
+
+    # Solve for the two rates so the SIZE-WEIGHTED overall is exactly C:
+    #     full_k*(1-c_K) + full_v*(1-c_V) == (1-C)*(full_k + full_v)
+    #     c_K - c_V                       == 2*delta
+    # =>  c_K = C + 2*delta*full_v/W,  c_V = C - 2*delta*full_k/W
+    # k_proj and v_proj share out_features on every Llama variant, so full_k ==
+    # full_v and this reduces to C +/- delta; the weighted form keeps the overall
+    # exact if they ever differ. The previous code used unequal offsets
+    # (+0.09/-0.11), which put the overall at C - 0.01 rather than at C.
+    W = full_k_params + full_v_params
+    k_comp_rate = min(C + 2.0 * delta * full_v_params / W, 0.99)
+    v_comp_rate = max(C - 2.0 * delta * full_k_params / W, 0.01)
     k_budget = int((1.0 - k_comp_rate) * full_k_params)
     v_budget = int((1.0 - v_comp_rate) * full_v_params)
+    # What the two budgets actually imply, after any clamping.
+    nominal_overall = 1.0 - (k_budget + v_budget) / W
+    _basis = ("KV cache elements/token"
+              if args.comp_metric == "cache" else "projection weight params (legacy)")
+    _rounding_on = args.rank_multiple > 1 or args.rank_multiple_v > 1
+    _when = ("raw phase-1 ranks, BEFORE the phase-2 round-up"
+             if args.budget_basis == "pre-level"
+             else "rounded ranks, AFTER the phase-2 round-up")
     print(
-        f"Compression targets: overall={args.desired_comp_rate:.0%} removed, "
-        f"K={k_comp_rate:.0%} removed ({1-k_comp_rate:.0%} remains, budget={k_budget:,}), "
-        f"V={v_comp_rate:.0%} removed ({1-v_comp_rate:.0%} remains, budget={v_budget:,})"
+        f"Compression targets [{_basis}], over the {_n_compressed} compressed layers "
+        f"(skipped layers are in neither numerator nor denominator):\n"
+        f"  budget basis = {args.budget_basis} ({_when})\n"
+        f"  overall = {nominal_overall:.1%} removed  (asked for {C:.1%}, split delta={delta:.3f})\n"
+        f"  K       = {k_comp_rate:.1%} removed ({1-k_comp_rate:.1%} remains, "
+        f"budget={k_budget:,} of {full_k_params:,})\n"
+        f"  V       = {v_comp_rate:.1%} removed ({1-v_comp_rate:.1%} remains, "
+        f"budget={v_budget:,} of {full_v_params:,})"
     )
+    # The export rounds every K head up to RANK_TILE anyway, so a pre-level
+    # budget only sits below the shipped size when the leveling is COARSER than
+    # the tile.
+    _k_levels_past_measure = args.rank_multiple > RANK_TILE
+    if (args.budget_basis == "pre-level" and _rounding_on
+            and not (_k_levels_past_measure or args.rank_multiple_v > 1)):
+        print(
+            f"  NOTE: the export already rounds every K head up to {RANK_TILE}, and\n"
+            f"  --rank-multiple {args.rank_multiple} is no coarser, so pre-level and\n"
+            f"  post-level measure the same cache here -- the basis makes no difference."
+        )
+    elif _rounding_on and args.budget_basis == "pre-level":
+        print(
+            f"  NOTE: with basis=pre-level the round-up to {args.rank_multiple} lands ON TOP of\n"
+            f"  this target, so the fused checkpoint will be LESS compressed than {C:.0%}\n"
+            f"  (about 6 points lower on Llama-3.2-3B at multiple 16) -- deliberately,\n"
+            f"  the slack is spent on accuracy. Quote the 'after freeze' figure, never\n"
+            f"  this target. Use --budget-basis post-level to land exactly on {C:.0%}."
+        )
+    if abs(nominal_overall - C) > 5e-3:
+        print(
+            f"  WARNING: the K/V split was clamped, so the overall budget is "
+            f"{nominal_overall:.1%}, not the {C:.1%} requested. Lower "
+            f"--kv-split-offset (currently {delta:.3f}) to restore it."
+        )
+    if args.comp_metric == "legacy":
+        print(
+            "  NOTE: 'legacy' counts (in+out)*rank against in*out, which is NOT the KV\n"
+            "  cache size (rank against out_features). They differ by (in+out)/in --\n"
+            f"  {_ratio_in_out(model):.2f}x here -- "
+            "and the legacy metric reads 0% until rank < in*out/(in+out)."
+        )
+    if args.rank_multiple > 1 or args.rank_multiple_v > 1:
+        print(
+            f"  Rank leveling ON at phase 2: "
+            f"K -> {'multiples of %d' % args.rank_multiple if args.rank_multiple > 1 else 'off'}, "
+            f"V -> {'multiples of %d' % args.rank_multiple_v if args.rank_multiple_v > 1 else 'off'}.\n"
+            + (f"  The phase-1 budget measures the POST-leveling cache, so "
+               f"--desired-comp-rate {args.desired_comp_rate:.2f} is what the leveled "
+               f"model actually achieves -- leveling buys accuracy, not a worse "
+               f"headline number."
+               if args.budget_basis == "post-level" else
+               f"  The phase-1 budget measures the PRE-leveling ranks, so the leveled "
+               f"model ends up less compressed than "
+               f"--desired-comp-rate {args.desired_comp_rate:.2f}.")
+        )
+    print(f"  At init: {comp_report(model)}")
 
     # ── Tokenizer & dataset ──────────────────────────────────────────────────
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
@@ -378,8 +583,8 @@ def main():
 
                 # ── Per-projection budget check; phase 2 when both done ────
                 if not phase2_entered:
-                    pk = collect_K_parameter_size(model, equal=True)
-                    pv = collect_V_parameter_size(model, equal=True)
+                    pk = meas_k(model)
+                    pv = meas_v(model)
 
                     if not k_frozen and pk <= k_budget:
                         k_frozen = True
@@ -418,9 +623,31 @@ def main():
                             if k_frozen and v_frozen
                             else f"alpha_samples={args.alpha_samples} step limit"
                         )
-                        # Step-limit fallback: budgets not both met, so freeze any
-                        # still-trainable alpha now
                         raw_model = accelerator.unwrap_model(model)
+                        # Round each K head's rank up to a tile boundary BEFORE the
+                        # alpha freeze, so phase 2 recovers into the restored
+                        # directions. Free at inference: the kernel already issues
+                        # ceil(r/16) tiles and masks the tail, so the surplus lanes
+                        # sit in tiles being issued anyway.
+                        # Phase 1's threshold search is over, so retire it: pin
+                        # every rank (K rounded up to a tile boundary) and switch
+                        # the forward pass to a binary keep mask. Must happen
+                        # before recovery -- phase 2 trains U, Sigma and V as
+                        # separate factors over exactly these directions.
+                        pbar.write(f"  [Phase 2] freezing ranks "
+                                   f"(K -> multiples of {max(args.rank_multiple, 1)}, "
+                                   f"V -> multiples of {max(args.rank_multiple_v, 1)})")
+                        pbar.write(f"    before freeze (raw phase-1 ranks): "
+                                   f"{comp_report(raw_model)}")
+                        freeze_ranks_at_multiple(
+                            raw_model, max(args.rank_multiple, 1), args.skip_layers,
+                            v_multiple=max(args.rank_multiple_v, 1),
+                        )
+                        pbar.write(f"    ACHIEVED (post-freeze, this is what the "
+                                   f"checkpoint has): {comp_report(raw_model)}")
+                        # Redundant now that the keep masks are pinned (alpha no
+                        # longer gates anything), but kept so alpha cannot collect
+                        # gradients or weight decay through recovery.
                         for n, p in raw_model.named_parameters():
                             if "alpha" in n:
                                 p.requires_grad_(False)
@@ -457,8 +684,8 @@ def main():
                         )
 
             if (step + 1) % args.log_steps == 0:
-                pk = collect_K_parameter_size(model, equal=True)
-                pv = collect_V_parameter_size(model, equal=True)
+                pk = meas_k(model)
+                pv = meas_v(model)
                 k_comp = 1.0 - pk / full_k_params
                 v_comp = 1.0 - pv / full_v_params
                 phase_tag = "phase1" if not phase2_entered else "phase2"
@@ -470,6 +697,11 @@ def main():
                     f"  K_comp={k_comp:.2%}(target={k_comp_rate:.0%})"
                     f"  V_comp={v_comp:.2%}(target={v_comp_rate:.0%})"
                 )
+                _rm = accelerator.unwrap_model(model)
+                pbar.write(f"            now:   {comp_report(_rm)}")
+                if _rounding_on and not phase2_entered:
+                    pbar.write(f"            after round-up it becomes: "
+                               f"{comp_report(_rm, _mult, _mult_v)}")
                 if wandb_run:
                     wandb_run.log({
                         "loss": loss.item(),
