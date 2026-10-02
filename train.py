@@ -12,8 +12,9 @@ Training runs in two phases over --num-samples blocks:
            --rank-multiple-v) and pinned, Sigma is fused into V and the dead
            directions are pruned -- the model is now in its deployed form -- and
            the remaining blocks are KD-only recovery of that fused model. The
-           best fused state is saved to --output: the ONLY artifact, used for
-           both accuracy eval and latency benchmarking.
+           fused state with the lowest KD on --val-samples held-out blocks is
+           saved to --output: the ONLY artifact, used for both accuracy eval and
+           latency benchmarking.
 
 Compression budget
 ------------------
@@ -39,6 +40,7 @@ Example
 
 import argparse
 import gc
+import itertools
 import os
 
 import torch
@@ -192,6 +194,9 @@ def parse_args():
                    help="Gradient accumulation steps")
     p.add_argument("--skip-layers", type=int, nargs="+", default=[0, 1, 2, 31],
                    help="Attention layer indices to leave uncompressed")
+    p.add_argument("--val-samples", type=int, default=16,
+                   help="Held-out blocks (the ones after the training blocks) on which "
+                        "phase 2's KD is measured every --log-steps to pick the saved checkpoint")
     p.add_argument("--log-steps", type=int, default=100,
                    help="Print training stats and save checkpoint every N steps")
     p.add_argument("--kv-split-offset", type=float, default=-1.0,
@@ -438,6 +443,8 @@ def main():
     train_iterable = CausalLMBlocks(
         ds, tokenizer, block_size=args.seq_len, max_blocks=args.num_samples
     )
+    val_blocks = list(itertools.islice(CausalLMBlocks(ds, tokenizer, block_size=args.seq_len),
+                                       args.num_samples, args.num_samples + args.val_samples))
     collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
     train_loader = DataLoader(
         train_iterable, batch_size=args.batch_size, collate_fn=collator
@@ -482,11 +489,9 @@ def main():
     )
 
     # ── Training loop ────────────────────────────────────────────────────────
-    # Only phase 2 states are saved: they are fused, at the final ranks, i.e.
-    # exactly what ships. The best of them (lowest loss at a log step) is what
-    # --output holds when training ends.
+    # Only phase 2 states are saved: fused, at the final ranks, i.e. exactly what
+    # ships. The one with the lowest KD on the held-out blocks is kept.
     best_loss = float("inf")
-    saved = False
     phase2_entered = False
     k_frozen = False  # K budget reached; K comp loss dropped
     v_frozen = False  # V budget reached; V comp loss dropped
@@ -504,6 +509,22 @@ def main():
         fuse_and_prune(raw, args.skip_layers)
         write("    Sigma fused into V and dead directions pruned")
         return raw
+
+    @torch.no_grad()
+    def save_if_best(write):
+        nonlocal best_loss
+        kd = 0.0
+        for b in val_blocks:
+            ids = b["input_ids"][None].to(accelerator.device)
+            s_logits, t_logits = model(input_ids=ids).logits[0, :-1], teacher(input_ids=ids).logits[0, :-1]
+            kd += F.kl_div(F.log_softmax(s_logits, dim=-1), F.softmax(t_logits, dim=-1),
+                           reduction="batchmean").item()
+        kd /= len(val_blocks)
+        if kd < best_loss:
+            best_loss = kd
+            torch.save(accelerator.unwrap_model(model).state_dict(), args.output)
+        write(f"  [phase2] val KD={kd:.4f}  best={best_loss:.4f}"
+              + ("  saved → " + args.output if kd == best_loss else ""))
 
     for epoch in range(args.epochs):
         pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{args.epochs}")
@@ -640,6 +661,7 @@ def main():
                             f"  [Phase 2] step={global_step + 1} ({reason}): KD-only "
                             f"recovery of the fused model for the remaining steps"
                         )
+                        save_if_best(pbar.write)
 
             if (step + 1) % args.log_steps == 0:
                 log = {"loss": loss.item(), "kd_loss": kd_loss.item(),
@@ -671,11 +693,7 @@ def main():
                         f"  [phase2] step={global_step + 1}"
                         f"  loss={loss.item():.4f}  kd={kd_loss.item():.4f}"
                     )
-                    if loss.item() < best_loss:
-                        best_loss = loss.item()
-                        torch.save(accelerator.unwrap_model(model).state_dict(), args.output)
-                        saved = True
-                        pbar.write(f"  Saved fused checkpoint → {args.output}")
+                    save_if_best(pbar.write)
                 if wandb_run:
                     wandb_run.log(log)
 
@@ -689,10 +707,8 @@ def main():
         gc.collect()
         torch.cuda.empty_cache()
         enter_phase2(print)
-    if not saved:
-        torch.save(accelerator.unwrap_model(model).state_dict(), args.output)
-    print(f"\nFinal fused checkpoint → {args.output}"
-          + (f" (best phase-2 loss {best_loss:.4f})" if saved else ""))
+    save_if_best(print)
+    print(f"\nFinal fused checkpoint → {args.output} (best val KD {best_loss:.4f})")
 
     if wandb_run:
         wandb_run.finish()
