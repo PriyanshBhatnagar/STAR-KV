@@ -4,7 +4,7 @@ Official implementation of the **ICML 2026 Spotlight** paper:
 
 **STAR-KV: Low-Rank KV Cache Compression via Soft Thresholding for Adaptive Rank Control**
 
-[Paper](#) [Project Page](#) [arXiv](https://arxiv.org/abs/2606.08382) [PMLR](#) <!-- links to be added -->
+[Paper](https://arxiv.org/abs/2606.08382) | [Project Page](https://icml.cc/virtual/2026/poster/61958) | [OpenReview](https://openreview.net/forum?id=lJjH1q6RwY&noteId=0YBoTCnGTc)
 
 ## Authors
 
@@ -30,12 +30,12 @@ Low-rank projection is a promising approach for compressing the KV cache because
 ## Todo Lists
 
 - [x] Add quantization latency tests 
-- [ ] Add trained weights file for LongChat, LLaMA-3.1-8B
+
 - [x] Update citation reference
-- [ ] Add links for project page, arXiv, PMLR
+- [x] Add links for project page, paper and OpenReview
 - [x] Fix kernels for acc analysis
 - [x] Pre-release of STAR-KV
-- [x] Wire 4-bit KV quantization (`kv_quant.py`) into eval and latency (`--kv-quant`)
+- [x] Wire 3.2-bit KV quantization (`kv_quant.py`) into eval and latency (`--kv-quant`)
 
 ## Repository Structure
 
@@ -48,7 +48,7 @@ Low-rank projection is a promising approach for compressing the KV cache because
 ├── soft_thres_layer.py                  # Learnable soft-threshold function
 ├── LlamaLoRaAttention_headwise.py       # Low-rank attention module
 ├── abx_rope_batched.py                  # Triton kernel: fused A@(B@X^T + RoPE) for K, per-head rank
-└── kv_quant.py                          # 4-bit KV quantization: format + Triton decode kernels
+└── kv_quant.py                          # 3.2-bit KV quantization: format + Triton decode kernels
 ```
 
 ## Installation
@@ -84,9 +84,9 @@ export WANDB_API_KEY="your_wandb_key"      # optional
 python train.py \
 --model lmsys/longchat-7b-v1.5-32k \
 --output fused_weights.pt \
---epochs 1 --lr 2e-5 --seq-len 8192 --num-samples 4000 \
+--epochs 1 --lr 2e-5 --seq-len 8192 --num-samples 5000 \
 --alpha-lr 1e-2 --alpha-samples 3000 --comp-weight-k 0.1 --comp-weight-v 0.1 --kd-weight 1.0 \
---comp-ratio 0.6 --skip-layers 0 1 2 31 \
+--comp-ratio 0.75 --skip-layers 0 1 2 31 \
 --rank-multiple-k 16 --rank-multiple-v 32
 ```
 
@@ -114,18 +114,18 @@ To evaluate perplexity on WikiText-2 and C4:
 python eval.py \
   --model lmsys/longchat-7b-v1.5-32k \
   --weights fused_weights.pt \
-  --ppl --ppl-datasets wikitext2,c4
+  --ppl --ppl-datasets wikitext2,c4 --ppl-seqlen 4096
 ```
 
 #### Zero-shot Accuracy
 
-To run zero-shot evaluations on PIQA, WinoGrande, ARC, HellaSwag, and OpenBookQA:
+To run zero-shot evaluations on PIQA, ARC, HellaSwag, and OpenBookQA:
 
 ```
 python eval.py \
   --model lmsys/longchat-7b-v1.5-32k \
   --weights fused_weights.pt \
-  --tasks piqa,winogrande,arc_easy,arc_challenge,openbookqa,hellaswag \
+  --tasks piqa,arc_easy,arc_challenge,openbookqa,hellaswag \
   --batch-size 32
 ```
 
@@ -170,7 +170,7 @@ python latency.py \
 
 Prefills, then averages 16 decode steps (`--steps`) through the whole model, and prints the time per token, tokens per second and the speedup. The whole model is on the GPU here, so the dense cache has to fit beside the weights; a model that runs out of memory is reported as OOM. At small batch × seq a decode step is bound by reading the weights rather than the cache, so STAR-KV pulls ahead once there are more than ~3–4K cached tokens (batch × seq).
 
-### 4-bit KV Quantization
+### 3.2-bit KV Quantization
 
 An add-on to the low-rank cache (`kv_quant.py`). Every K/V latent is quantized per token: each head's leading 20% of channels (the outliers) at 4 bits and the rest at 3 bits, each group with its own scale. Before quantizing, each group is rotated by a Hadamard transform that is folded offline into the low-rank factors, so it adds no work at run time.
 
@@ -180,7 +180,7 @@ Accuracy, with fp32 fake quantization on the PyTorch path (add `--triton` to run
 python eval.py \
   --model lmsys/longchat-7b-v1.5-32k \
   --weights fused_weights.pt \
-  --kv-quant --tasks piqa,openbookqa
+  --kv-quant --tasks piqa,arc_easy,arc_challenge,openbookqa,hellaswag
 ```
 
 Latency, with the packed 4-bit cache and the Triton kernels:
@@ -192,7 +192,7 @@ python latency.py \
   --seq 32768 --batch 16 --kv-quant
 ```
 
-Layer-wise decode latency at batch 16 on an RTX 4090, averaged over the 28 compressed layers of longchat-7b:
+Layer-wise decode latency at batch 16 on an RTX 4090, averaged over the compressed layers of longchat-7b:
 
 | Context | Dense | STAR-KV (bf16) | STAR-KV + 4-bit KV | 4-bit vs dense | 4-bit vs bf16 |
 |---|---|---|---|---|---|
@@ -204,7 +204,7 @@ Layer-wise decode latency at batch 16 on an RTX 4090, averaged over the 28 compr
 
 \* A single dense layer does not fit at 64K × batch 16, so this point is extrapolated linearly from 16K and 32K.
 
-The 4-bit decode kernels are MHA-only (e.g. longchat-7b); on GQA models, `eval.py --kv-quant` still measures accuracy through the fake-quant path.
+The 3.2-bit decode kernels are MHA-only (e.g. longchat-7b); on GQA models, `eval.py --kv-quant` still measures accuracy through the fake-quant path.
 
 
 ## Reference
