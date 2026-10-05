@@ -15,3 +15,4 @@ tqdm==4.70.0
 tiktoken==0.14.0
 sentencepiece==0.2.2
 protobuf==7.36.1
+torch-optimi==0.3.3

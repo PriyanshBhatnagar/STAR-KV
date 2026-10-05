@@ -43,6 +43,7 @@ import gc
 import itertools
 import os
 
+import optimi
 import torch
 import torch.nn.functional as F
 from accelerate import Accelerator
@@ -456,7 +457,7 @@ def main():
     # on the alpha params (not by zeroing the group lr), because the LR scheduler
     # re-applies base_lr*factor to every group each step and would otherwise undo it.
     no_decay = ["bias", "layer_norm.weight"]
-    optimizer = torch.optim.AdamW([
+    optimizer = optimi.AdamW([
         {
             "params": [p for n, p in model.named_parameters()
                        if not any(nd in n for nd in no_decay) and "alpha" not in n],
@@ -477,7 +478,7 @@ def main():
                        if any(nd in n for nd in no_decay) and "alpha" not in n],
             "weight_decay": 0.0, "lr": args.lr,
         },
-    ])
+    ], lr=args.lr, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.01, kahan_sum=True)
 
     # ── Accelerator ──────────────────────────────────────────────────────────
     accelerator = Accelerator()
@@ -633,7 +634,7 @@ def main():
                         torch.cuda.empty_cache()
                         # Fresh optimizer over the fused model, so phase 1's momentum
                         # does not carry into recovery.
-                        optimizer = torch.optim.AdamW([
+                        optimizer = optimi.AdamW([
                             {
                                 "params": [
                                     p for n, p in raw_model.named_parameters()
@@ -650,7 +651,7 @@ def main():
                                 ],
                                 "weight_decay": 0.0, "lr": 5e-6,
                             },
-                        ])
+                        ], lr=5e-6, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.01, kahan_sum=True)
                         steps_remaining = max(1, num_steps - global_step)
                         lr_sched = get_scheduler(
                             "linear", optimizer=optimizer,
