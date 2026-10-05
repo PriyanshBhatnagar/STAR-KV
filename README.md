@@ -194,13 +194,13 @@ python latency.py \
 
 Layer-wise decode latency at batch 16 on an RTX 4090, averaged over the compressed layers of longchat-7b:
 
-| Context | Dense | STAR-KV (bf16) | STAR-KV + 4-bit KV | 4-bit vs dense | 4-bit vs bf16 |
+| Ctx Len | SDPA (FA2) | STAR-KV (bf16) | STAR-KV + 3.2-bit KV | Speedup (STAR-KV vs. SDPA) | Speedup (STAR-KV + 3.2-bit vs. SDPA) |
 |---|---|---|---|---|---|
-| 4K  | 3,727 µs   | 1,306 µs  | 697 µs   | 5.3x | 1.9x |
-| 8K  | 7,267 µs   | 2,340 µs  | 1,087 µs | 6.7x | 2.2x |
-| 16K | 14,390 µs  | 4,492 µs  | 1,872 µs | 7.7x | 2.4x |
-| 32K | 27,860 µs  | 8,912 µs  | 3,474 µs | 8.0x | 2.6x |
-| 64K | 54,800 µs* | 17,792 µs | 6,712 µs | 8.2x | 2.7x |
+| 4K  | 3,727 µs   | 1,306 µs  | 697 µs   | 2.9x | 5.3x |
+| 8K  | 7,267 µs   | 2,340 µs  | 1,087 µs | 3.1x | 6.7x |
+| 16K | 14,390 µs  | 4,492 µs  | 1,872 µs | 3.2x | 7.7x |
+| 32K | 27,860 µs  | 8,912 µs  | 3,474 µs | 3.1x | 8.0x |
+| 64K | 54,800 µs* | 17,792 µs | 6,712 µs | 3.1x | 8.2x |
 
 \* A single dense layer does not fit at 64K × batch 16, so this point is extrapolated linearly from 16K and 32K.
 
