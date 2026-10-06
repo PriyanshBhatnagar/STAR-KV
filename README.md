@@ -85,7 +85,7 @@ python train.py \
 --model lmsys/longchat-7b-v1.5-32k \
 --output fused_weights.pt \
 --epochs 1 --lr 2e-5 --seq-len 8192 --num-samples 5000 \
---alpha-lr 1e-2 --alpha-samples 3000 --comp-weight-k 0.1 --comp-weight-v 0.1 --kd-weight 1.0 \
+--alpha-lr 1e-2 --alpha-samples 3000 --comp-weight-k 0.01 --comp-weight-v 0.01 --kd-weight 1.0 \
 --comp-ratio 0.75 --skip-layers 0 1 2 31 \
 --rank-multiple-k 16 --rank-multiple-v 32
 ```

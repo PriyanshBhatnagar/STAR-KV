@@ -325,10 +325,7 @@ def main():
     # ── LongBench ────────────────────────────────────────────────────────────
     if args.longbench:
         longbench_tasks = (
-            "longbench_hotpotqa,longbench_qasper,longbench_triviaqa,"
-            "longbench_multi_news,longbench_trec,longbench_lcc,"
-            "longbench_samsum,longbench_narrativeqa,longbench_qmsum,"
-            "longbench_vcsum,longbench_dureader"
+            "longbench_qasper, longbench_multi_news,longbench_trec,longbench_qmsum,longbench_vcsum"
         )
         print("\n=== LongBench ===")
         res = evaluate_lmeval(
