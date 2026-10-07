@@ -4,7 +4,7 @@ Official implementation of the **ICML 2026 Spotlight** paper:
 
 **STAR-KV: Low-Rank KV Cache Compression via Soft Thresholding for Adaptive Rank Control**
 
-[Paper](https://arxiv.org/abs/2606.08382) | [Project Page](https://icml.cc/virtual/2026/poster/61958) | [OpenReview](https://openreview.net/forum?id=lJjH1q6RwY&noteId=0YBoTCnGTc)
+[Paper](https://arxiv.org/abs/2606.08382) | [Project Page](https://icml.cc/virtual/2026/poster/61958) | [OpenReview](https://openreview.net/forum?id=lJjH1q6RwY&noteId=0YBoTCnGTc) | [vLLM Integration](https://github.com/PriyanshBhatnagar/STAR-KV-Serve)
 
 ## Authors
 

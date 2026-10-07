@@ -393,10 +393,9 @@ def main():
               if args.comp_metric == "cache" else "projection weight params (legacy)")
     _rounding_on = args.rank_multiple_k > 1 or args.rank_multiple_v > 1
     print(
-        f"Compression targets [{_basis}], over the {_n_compressed} compressed layers "
-        f"(skipped layers are in neither numerator nor denominator):\n"
-        f"  overall = {nominal_overall:.1%} removed  (--comp-ratio {C:.1%} less "
-        f"{COMP_SLACK:.1%} slack, split delta={delta:.3f})\n"
+        f"Compression targets [{_basis}], over the compressed layers "
+        f"(layers {', '.join(str(i) for i in sorted(set(args.skip_layers)))} are uncompressed):\n"
+        f"  overall = {nominal_overall:.1%} removed  (split delta={delta:.3f})\n"
         f"  K       = {k_comp_rate:.1%} removed ({1-k_comp_rate:.1%} remains, "
         f"budget={k_budget:,} of {full_k_params:,})\n"
         f"  V       = {v_comp_rate:.1%} removed ({1-v_comp_rate:.1%} remains, "
